@@ -28,6 +28,7 @@ httpx                      # requisições HTTP assíncronas
 # --- Upload de arquivos ---
 python-multipart           # Form, File, UploadFile no FastAPI
 cloudinary                 # upload de imagens (avatares, etc.)
+psycopg2-binary
 
 # --- Pagamentos ---
 mercadopago                # SDK oficial do Mercado Pago
