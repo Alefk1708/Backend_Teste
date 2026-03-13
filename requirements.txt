@@ -1,0 +1,36 @@
+# ============================================================
+# requirements.txt — Dentista Fácil Backend
+# Gerado com base em todos os arquivos do projeto
+# ============================================================
+
+# --- Web Framework ---
+fastapi
+uvicorn[standard]          # servidor ASGI com WebSocket support
+
+# --- Banco de Dados ---
+sqlalchemy
+alembic                    # migrations
+
+# --- Autenticação & Segurança ---
+python-jose[cryptography]  # JWT tokens
+passlib[bcrypt]            # hash de senhas
+
+# --- Validação & Schemas ---
+pydantic[email]            # inclui email-validator
+email-validator            # usado explicitamente em vários schemas
+
+# --- Configuração ---
+python-dotenv              # carrega o .env
+
+# --- HTTP Client ---
+httpx                      # requisições HTTP assíncronas
+
+# --- Upload de arquivos ---
+python-multipart           # Form, File, UploadFile no FastAPI
+cloudinary                 # upload de imagens (avatares, etc.)
+
+# --- Pagamentos ---
+mercadopago                # SDK oficial do Mercado Pago
+
+# --- Email ---
+# smtplib já vem na stdlib do Python — não precisa instalar
