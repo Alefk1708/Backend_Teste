@@ -127,6 +127,12 @@ async def create_pix(
             detail=f"Agendamento não está aguardando pagamento (status: {appointment.status})"
         )
 
+    if appointment.total_amount is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Valor do agendamento não definido. Entre em contato com o suporte."
+        )
+
     existing = db.query(Payment).filter(
         Payment.appointment_id == data.appointment_id,
         Payment.status.in_(["pending", "completed"]),
@@ -213,6 +219,12 @@ async def create_card(
 
     if appointment.status not in ["awaiting_payment", "pending"]:
         raise HTTPException(status_code=400, detail="Agendamento não está aguardando pagamento")
+
+    if appointment.total_amount is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Valor do agendamento não definido. Entre em contato com o suporte."
+        )
 
     existing_paid = db.query(Payment).filter(
         Payment.appointment_id == data.appointment_id,

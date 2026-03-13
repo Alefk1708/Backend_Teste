@@ -508,49 +508,80 @@ def create_appointment(
     user = current_user["user"]
     if current_user["payload"]["type"] != "paciente":
         raise HTTPException(status_code=403, detail="Apenas pacientes podem agendar")
-    
+
+    # Busca o procedimento global (fonte do preço)
+    global_proc = db.query(Procedure).filter(
+        Procedure.id == data.procedure_id,
+        Procedure.is_active == True
+    ).first()
+
+    if not global_proc:
+        raise HTTPException(status_code=404, detail="Procedimento não encontrado ou inativo")
+
+    # Verifica se a clínica oferece este procedimento
     clinic_proc = db.query(ClinicProcedure).filter(
         ClinicProcedure.clinic_id == data.clinic_id,
-        ClinicProcedure.procedure_id == data.procedure_id
+        ClinicProcedure.procedure_id == data.procedure_id,
+        ClinicProcedure.is_active == True
     ).first()
-    
+
     if not clinic_proc:
         raise HTTPException(status_code=404, detail="Procedimento não encontrado na clínica")
-    
-    is_first = is_first_appointment(db, user.id, data.clinic_id)
-    
-    total_amount = clinic_proc.price
-    if is_first:
-        platform_fee = total_amount
-        clinic_amount = 0
+
+    # Calcula preço: lentes de contato têm preço por dente, demais usam preço global
+    is_lentes = global_proc.category == "lentes_contato"
+    if is_lentes and data.lens_upper_count is not None and data.lens_lower_count is not None:
+        total_teeth = data.lens_upper_count + data.lens_lower_count
+        if total_teeth == 0:
+            raise HTTPException(status_code=400, detail="Selecione ao menos 1 dente para lentes de contato")
+        effective_price = global_proc.price * total_teeth
     else:
-        platform_fee = total_amount * 0.15
-        clinic_amount = total_amount * 0.85
-    
+        effective_price = global_proc.price
+
+    if effective_price is None:
+        raise HTTPException(status_code=400, detail="Preço do procedimento não definido")
+
+    is_consulta = "consulta" in global_proc.name.lower() or global_proc.category == "consulta"
+    service_type = "first_consultation" if is_consulta else "procedure"
+
+    financial_split = calculate_financial_split(
+        db,
+        user.id,
+        data.clinic_id,
+        effective_price,
+        service_type
+    )
+
     appointment = Appointment(
         id=str(uuid.uuid4()),
         patient_id=user.id,
         clinic_id=data.clinic_id,
         procedure_id=data.procedure_id,
-        service_type="procedure",
-        status="pending",
+        service_type=financial_split["service_type"],
+        status="awaiting_payment",
         type="scheduled",
         scheduled_at=data.scheduled_at,
         description=data.notes,
-        total_amount=total_amount,
-        platform_fee=platform_fee,
-        clinic_amount=clinic_amount
+        total_amount=financial_split["total_amount"],
+        platform_fee=financial_split["platform_fee"],
+        clinic_amount=financial_split["clinic_amount"],
+        payment_deadline=datetime.utcnow() + timedelta(hours=1),
+        patient_latitude=data.patient_latitude,
+        patient_longitude=data.patient_longitude,
+        lens_upper_count=data.lens_upper_count if is_lentes else None,
+        lens_lower_count=data.lens_lower_count if is_lentes else None,
+        lens_total_price=effective_price if is_lentes else None,
     )
-    
+
     db.add(appointment)
     db.commit()
-    
+
     return {
         "appointment_id": appointment.id,
-        "total_amount": total_amount,
-        "platform_fee": platform_fee,
-        "clinic_amount": clinic_amount,
-        "is_first_appointment": is_first,
+        "total_amount": financial_split["total_amount"],
+        "platform_fee": financial_split["platform_fee"],
+        "clinic_amount": financial_split["clinic_amount"],
+        "is_first_appointment": financial_split["is_first_time"],
         "message": "Agendamento criado. Proceda com o pagamento para confirmar."
     }
 
