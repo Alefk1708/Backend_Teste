@@ -129,8 +129,21 @@ def create_card_payment(
     response = result["response"]
 
     if result["status"] not in [200, 201]:
+        import logging
         error_msg = response.get("message", "Erro desconhecido no Mercado Pago")
-        raise ValueError(f"Erro ao processar cartão: {error_msg}")
+        causes = response.get("cause", [])
+        cause_detail = ""
+        if causes:
+            cause_detail = " | " + ", ".join(
+                f"code={c.get('code')} desc={c.get('description')}"
+                for c in causes if isinstance(c, dict)
+            )
+        logging.error(
+            f"[MP cartao] HTTP {result['status']} - {error_msg}{cause_detail} | "
+            f"method={payment_method_id} issuer={issuer_id} installments={installments} amount={amount} | "
+            f"full_response={response}"
+        )
+        raise ValueError(f"Erro MP ({result['status']}): {error_msg}{cause_detail}")
 
     mp_status = response["status"]
     # approved | in_process | rejected | pending

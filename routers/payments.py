@@ -49,8 +49,8 @@ class CardPaymentRequest(BaseModel):
     appointment_id: str
     token: str              # Token gerado pelo SDK JS do Mercado Pago no frontend
     installments: int = 1
-    payment_method_id: str  # "visa", "master", "elo", etc.
-    issuer_id: Optional[str] = None
+    payment_method_id: str  # "visa", "master", "elo", etc. — deve vir do SDK JS do MP
+    issuer_id: str          # ID do banco emissor — OBRIGATÓRIO, deve vir do SDK JS do MP
 
 
 # ==========================================
@@ -162,7 +162,9 @@ async def create_pix(
             description=f"Dentista Facil - Consulta #{str(appointment.id)[:8]}",
         )
     except ValueError as e:
-        raise HTTPException(status_code=502, detail=str(e))
+        import logging
+        logging.error(f"[/payments/card] MP recusou: {e} | user={user.id} | appointment={appointment.id} | method={data.payment_method_id} | issuer={data.issuer_id} | installments={data.installments}")
+        raise HTTPException(status_code=400, detail=str(e))
 
     payment = Payment(
         id=str(uuid.uuid4()),
