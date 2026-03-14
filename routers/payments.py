@@ -52,6 +52,12 @@ class CardPaymentRequest(BaseModel):
     payment_method_id: str  # "visa", "master", "elo", etc. — deve vir do SDK JS do MP
     issuer_id: str          # ID do banco emissor — OBRIGATÓRIO, deve vir do SDK JS do MP
 
+    class Config:
+        pass
+
+    def __init__(self, **data):
+        super().__init__(**data)
+
 
 # ==========================================
 # HELPERS INTERNOS
@@ -163,7 +169,7 @@ async def create_pix(
         )
     except ValueError as e:
         import logging
-        logging.error(f"[/payments/card] MP recusou: {e} | user={user.id} | appointment={appointment.id} | method={data.payment_method_id} | issuer={data.issuer_id} | installments={data.installments}")
+        logging.error(f"[/payments/pix] MP recusou: {e} | user={user.id} | appointment={appointment.id}")
         raise HTTPException(status_code=400, detail=str(e))
 
     payment = Payment(
@@ -235,6 +241,9 @@ async def create_card(
     if existing_paid:
         raise HTTPException(status_code=400, detail="Agendamento já foi pago")
 
+    if not (1 <= data.installments <= 12):
+        raise HTTPException(status_code=400, detail="Número de parcelas inválido (deve ser entre 1 e 12)")
+
     try:
         mp_result = create_card_payment(
             appointment_id=str(appointment.id),
@@ -249,7 +258,34 @@ async def create_card(
             description=f"Dentista Facil - Consulta #{str(appointment.id)[:8]}",
         )
     except ValueError as e:
-        raise HTTPException(status_code=502, detail=str(e))
+        error_str = str(e)
+        # Cartão internacional sem suporte a parcelamento
+        if "INTERNATIONAL_NO_INSTALLMENTS" in error_str:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "INTERNATIONAL_NO_INSTALLMENTS",
+                    "message": (
+                        "Este cartão internacional não permite parcelamento. "
+                        "Por favor, selecione 1x ou utilize outro método de pagamento."
+                    ),
+                    "can_retry_with_1x": data.installments > 1,
+                },
+            )
+        # Bandeira/emissor não suporta as parcelas solicitadas
+        if "INSTALLMENTS_NOT_SUPPORTED" in error_str:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "INSTALLMENTS_NOT_SUPPORTED",
+                    "message": (
+                        "Parcelamento não disponível para este cartão. "
+                        "Por favor, pague em 1x."
+                    ),
+                    "can_retry_with_1x": data.installments > 1,
+                },
+            )
+        raise HTTPException(status_code=502, detail=error_str)
 
     mp_status = mp_result["status"]
     internal_status = {
@@ -327,36 +363,67 @@ async def mercadopago_webhook(
     x_request_id: Optional[str] = Header(None),
 ):
     """
-    Recebe notificacoes do Mercado Pago.
-    Configure em: https://www.mercadopago.com.br/developers/panel/app -> Webhooks
-    URL publica: https://SUA-URL/payments/webhook
-    Para testes locais use ngrok: ngrok http 8000
+    Recebe notificações do Mercado Pago.
+
+    CONFIGURAÇÃO EM PRODUÇÃO:
+      1. https://www.mercadopago.com.br/developers/panel/app → Webhooks
+      2. Adicionar URL: https://SUA-URL/payments/webhook  (evento: Pagamentos)
+      3. Copiar o Secret gerado → definir como MERCADOPAGO_WEBHOOK_SECRET
+      4. Definir APP_BASE_URL com a URL pública da API
+
+    O MP reenvia o webhook em caso de timeout/5xx, por isso o endpoint é
+    idempotente: pagamentos já confirmados retornam 200 sem reprocessar.
     """
-    body = await request.json()
+    import logging
+    import os
+
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Body inválido")
+
+    # ── Validar assinatura HMAC ───────────────────────────────────────────────
+    is_production = bool(os.getenv("MERCADOPAGO_WEBHOOK_SECRET", ""))
 
     if x_signature and x_request_id:
         data_id = str(body.get("data", {}).get("id", ""))
         if not validate_webhook_signature(x_signature, x_request_id, data_id):
-            raise HTTPException(status_code=401, detail="Assinatura do webhook invalida")
+            logging.error(
+                "[webhook] Assinatura rejeitada | x_request_id=%s | data_id=%s",
+                x_request_id, data_id,
+            )
+            raise HTTPException(status_code=401, detail="Assinatura do webhook inválida")
+    elif is_production:
+        # Em produção, rejeitar qualquer webhook sem headers de assinatura
+        logging.error("[webhook] Headers de assinatura ausentes em produção")
+        raise HTTPException(status_code=401, detail="Headers de assinatura obrigatórios em produção")
+    else:
+        logging.warning("[webhook] Recebido sem assinatura (modo desenvolvimento)")
 
+    # ── Filtrar eventos ───────────────────────────────────────────────────────
     event_type = body.get("type")
     if event_type != "payment":
-        return {"status": "ignored"}
+        return {"status": "ignored", "event": event_type}
 
     mp_payment_id = str(body.get("data", {}).get("id", ""))
     if not mp_payment_id:
-        return {"status": "ignored"}
+        return {"status": "ignored", "reason": "data.id ausente"}
 
+    logging.info("[webhook] Processando evento payment | mp_id=%s", mp_payment_id)
+
+    # ── Consultar status real no MP (não confiar só no payload) ───────────────
     try:
         mp_data = get_payment_status(mp_payment_id)
-    except ValueError:
-        return {"status": "error", "reason": "Pagamento nao encontrado no MP"}
+    except ValueError as e:
+        logging.error("[webhook] Erro ao consultar MP | mp_id=%s | erro=%s", mp_payment_id, e)
+        return {"status": "error", "reason": "Pagamento não encontrado no MP"}
 
     mp_status = mp_data["status"]
+    logging.info("[webhook] Status MP | mp_id=%s | status=%s", mp_payment_id, mp_status)
 
+    # ── Localizar Payment no banco ────────────────────────────────────────────
     payment = db.query(Payment).filter(Payment.external_id == mp_payment_id).first()
 
-    # Tenta pelo appointment se nao achou pelo external_id
     if not payment:
         external_reference = str(body.get("data", {}).get("external_reference", ""))
         if external_reference:
@@ -366,18 +433,22 @@ async def mercadopago_webhook(
             ).first()
 
     if not payment:
-        return {"status": "ignored", "reason": "Pagamento nao encontrado no banco"}
+        logging.warning("[webhook] Payment não encontrado no banco | mp_id=%s", mp_payment_id)
+        return {"status": "ignored", "reason": "Payment não encontrado no banco"}
 
+    # ── Idempotência ──────────────────────────────────────────────────────────
     if payment.status == "completed":
-        return {"status": "ok", "reason": "Ja confirmado"}
+        logging.info("[webhook] Já confirmado, ignorando | payment_id=%s", payment.id)
+        return {"status": "ok", "reason": "Já confirmado"}
 
     appointment = db.query(Appointment).filter(
         Appointment.id == payment.appointment_id
     ).first()
-
     if not appointment:
-        return {"status": "error", "reason": "Agendamento nao encontrado"}
+        logging.error("[webhook] Appointment não encontrado | payment_id=%s", payment.id)
+        return {"status": "error", "reason": "Agendamento não encontrado"}
 
+    # ── Processar conforme status ─────────────────────────────────────────────
     if mp_status == "approved":
         payment.external_id = mp_payment_id
         _confirm_appointment_paid(db, appointment, payment)
@@ -400,10 +471,12 @@ async def mercadopago_webhook(
                 "timestamp": datetime.utcnow().isoformat(),
             },
         )
+        logging.info("[webhook] Pagamento aprovado e consulta confirmada | payment_id=%s", payment.id)
 
     elif mp_status in ["rejected", "cancelled"]:
         payment.status = "failed"
         db.commit()
+        logging.info("[webhook] Pagamento %s | payment_id=%s", mp_status, payment.id)
 
     elif mp_status in ["refunded", "charged_back"]:
         payment.status = "refunded"
@@ -411,6 +484,10 @@ async def mercadopago_webhook(
         appointment.status = "cancelled"
         appointment.cancellation_reason = "Pagamento estornado"
         db.commit()
+        logging.info("[webhook] Pagamento estornado | payment_id=%s", payment.id)
+
+    else:
+        logging.info("[webhook] Status intermediário '%s' | payment_id=%s", mp_status, payment.id)
 
     return {"status": "ok"}
 

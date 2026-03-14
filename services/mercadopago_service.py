@@ -133,7 +133,9 @@ def create_card_payment(
         error_msg = response.get("message", "Erro desconhecido no Mercado Pago")
         causes = response.get("cause", [])
         cause_detail = ""
+        cause_codes = []
         if causes:
+            cause_codes = [c.get("code") for c in causes if isinstance(c, dict)]
             cause_detail = " | " + ", ".join(
                 f"code={c.get('code')} desc={c.get('description')}"
                 for c in causes if isinstance(c, dict)
@@ -143,6 +145,23 @@ def create_card_payment(
             f"method={payment_method_id} issuer={issuer_id} installments={installments} amount={amount} | "
             f"full_response={response}"
         )
+
+        # Erros semânticos conhecidos — retornar mensagem clara para o usuário
+        # 10114: cartão internacional não permite parcelamento
+        if 10114 in cause_codes:
+            raise ValueError(
+                "INTERNATIONAL_NO_INSTALLMENTS: "
+                "Este cartão internacional não permite parcelamento. "
+                "Por favor, pague em 1x ou use outro método de pagamento."
+            )
+        # 10102: parâmetros inválidos para a bandeira/emissor (ex: ELO sem suporte)
+        if 10102 in cause_codes:
+            raise ValueError(
+                "INSTALLMENTS_NOT_SUPPORTED: "
+                "Parcelamento não disponível para este cartão. "
+                "Por favor, pague em 1x."
+            )
+
         raise ValueError(f"Erro MP ({result['status']}): {error_msg}{cause_detail}")
 
     mp_status = response["status"]
@@ -216,24 +235,53 @@ def get_payment_status(external_id: str) -> dict:
 
 def validate_webhook_signature(x_signature: str, x_request_id: str, data_id: str) -> bool:
     """
-    Valida a assinatura do webhook do Mercado Pago.
-    https://www.mercadopago.com.br/developers/pt/docs/your-integrations/notifications/webhooks
+    Valida a assinatura HMAC-SHA256 enviada pelo Mercado Pago em cada webhook.
+
+    O header x-signature tem o formato:  ts=<timestamp>,v1=<hex_digest>
+    O manifest assinado pelo MP é:       id:<data.id>;request-id:<x-request-id>;ts:<ts>;
+
+    ATENÇÃO: o `ts` faz parte do manifest — sem ele o digest nunca bate.
+
+    Ref: https://www.mercadopago.com.br/developers/pt/docs/your-integrations/notifications/webhooks
     """
     import hmac
     import hashlib
+    import logging
 
     if not WEBHOOK_SECRET:
-        # Em desenvolvimento, aceita sem validar
+        logging.warning(
+            "[webhook] MERCADOPAGO_WEBHOOK_SECRET não definido — "
+            "validação de assinatura DESATIVADA. Configure em produção!"
+        )
         return True
 
-    manifest = f"id:{data_id};request-id:{x_request_id};"
-    expected = hmac.new(
+    # Extrair ts e v1 do header "ts=1234567890,v1=abcdef..."
+    parts = {}
+    for part in x_signature.split(","):
+        if "=" in part:
+            k, v = part.split("=", 1)
+            parts[k.strip()] = v.strip()
+
+    ts = parts.get("ts", "")
+    received_digest = parts.get("v1", "")
+
+    if not ts or not received_digest:
+        logging.error("[webhook] x-signature mal formatado: %s", x_signature)
+        return False
+
+    # Manifest exatamente como o MP assina — ts é obrigatório
+    manifest = f"id:{data_id};request-id:{x_request_id};ts:{ts};"
+
+    expected_digest = hmac.new(
         WEBHOOK_SECRET.encode("utf-8"),
         manifest.encode("utf-8"),
-        hashlib.sha256
+        hashlib.sha256,
     ).hexdigest()
 
-    parts = dict(p.split("=", 1) for p in x_signature.split(",") if "=" in p)
-    received = parts.get("v1", "")
-
-    return hmac.compare_digest(expected, received)
+    valid = hmac.compare_digest(expected_digest, received_digest)
+    if not valid:
+        logging.error(
+            "[webhook] Assinatura inválida | manifest=%s | received=%s | expected=%s",
+            manifest, received_digest, expected_digest,
+        )
+    return valid
