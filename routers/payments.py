@@ -17,14 +17,17 @@ Reembolso:
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Header, BackgroundTasks
 from sqlalchemy.orm import Session
+from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 from database import get_db
 from core.security import get_current_user
-from models.models import Payment, Appointment, User, Clinic, Notification
+from models.models import Payment, Appointment, User, Clinic, Notification, PaymentIdempotency
 from pydantic import BaseModel
 from typing import Optional
-from datetime import datetime
+from datetime import datetime, timedelta
 import uuid
 import json
+import logging
 
 from routers.websocket import manager
 from services.mercadopago_service import (
@@ -51,12 +54,7 @@ class CardPaymentRequest(BaseModel):
     installments: int = 1
     payment_method_id: str  # "visa", "master", "elo", etc. — deve vir do SDK JS do MP
     issuer_id: str          # ID do banco emissor — OBRIGATÓRIO, deve vir do SDK JS do MP
-
-    class Config:
-        pass
-
-    def __init__(self, **data):
-        super().__init__(**data)
+    idempotency_key: Optional[str] = None  # UUID v4 gerado pelo frontend antes do envio
 
 
 # ==========================================
@@ -139,6 +137,27 @@ async def create_pix(
             detail="Valor do agendamento não definido. Entre em contato com o suporte."
         )
 
+    # ── SELECT FOR UPDATE: lock no agendamento ───────────────────────────────
+    # Bloqueia a linha do agendamento durante a transação inteira, impedindo
+    # que duas requisições simultâneas (duplo clique, retry) passem ao mesmo
+    # tempo pela verificação e criem dois payments para o mesmo agendamento.
+    db.execute(
+        text("SELECT id FROM appointments WHERE id = :aid FOR UPDATE"),
+        {"aid": data.appointment_id},
+    )
+
+    # Re-buscar o agendamento dentro do lock para garantir estado atualizado
+    appointment = db.query(Appointment).filter(
+        Appointment.id == data.appointment_id
+    ).first()
+
+    if appointment.status not in ["awaiting_payment", "pending"]:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Agendamento não está aguardando pagamento (status: {appointment.status})"
+        )
+
+    # Verificar payments existentes dentro do lock
     existing = db.query(Payment).filter(
         Payment.appointment_id == data.appointment_id,
         Payment.status.in_(["pending", "completed"]),
@@ -148,6 +167,7 @@ async def create_pix(
         raise HTTPException(status_code=400, detail="Este agendamento já foi pago")
 
     if existing and existing.status == "pending" and existing.pix_code:
+        # Idempotência: PIX já foi gerado, retornar o mesmo
         return {
             "payment_id": existing.id,
             "status": "pending",
@@ -225,24 +245,101 @@ async def create_card(
     if str(appointment.patient_id) != str(user.id):
         raise HTTPException(status_code=403, detail="Agendamento não pertence a este usuário")
 
-    if appointment.status not in ["awaiting_payment", "pending"]:
-        raise HTTPException(status_code=400, detail="Agendamento não está aguardando pagamento")
-
     if appointment.total_amount is None:
         raise HTTPException(
             status_code=400,
             detail="Valor do agendamento não definido. Entre em contato com o suporte."
         )
 
+    if not (1 <= data.installments <= 12):
+        raise HTTPException(status_code=400, detail="Número de parcelas inválido (deve ser entre 1 e 12)")
+
+    # ── Idempotência: mesma key = mesmo resultado ─────────────────────────────
+    # O frontend gera um UUID antes de enviar. Se a key já existe e o pagamento
+    # foi concluído, retorna o resultado salvo sem chamar o MP novamente.
+    if data.idempotency_key:
+        now = datetime.utcnow()
+        existing_idem = db.query(PaymentIdempotency).filter(
+            PaymentIdempotency.key == data.idempotency_key,
+            PaymentIdempotency.expires_at > now,
+        ).first()
+
+        if existing_idem:
+            if existing_idem.status == "processing":
+                # Outra requisição está em andamento com a mesma key agora mesmo
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "PAYMENT_IN_PROGRESS",
+                        "message": "Pagamento já está sendo processado. Aguarde.",
+                    },
+                )
+            if existing_idem.status in ("done", "failed") and existing_idem.response:
+                # Retornar resposta idempotente armazenada
+                logging.info(
+                    "[card] Idempotência: retornando resposta salva | key=%s",
+                    data.idempotency_key,
+                )
+                return json.loads(existing_idem.response)
+
+        # Registrar a key como "processing" antes de qualquer operação
+        idem_record = PaymentIdempotency(
+            key=data.idempotency_key,
+            status="processing",
+            created_at=now,
+            expires_at=now + timedelta(minutes=30),
+        )
+        db.add(idem_record)
+        try:
+            db.flush()  # inserir imediatamente para que outros requests vejam
+        except Exception:
+            db.rollback()
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "PAYMENT_IN_PROGRESS",
+                    "message": "Pagamento já está sendo processado. Aguarde.",
+                },
+            )
+    else:
+        idem_record = None
+
+    # ── SELECT FOR UPDATE: lock no agendamento ────────────────────────────────
+    # Bloqueia a linha durante a transação inteira — nenhuma outra requisição
+    # simultânea consegue passar por aqui até esta terminar o commit/rollback.
+    db.execute(
+        text("SELECT id FROM appointments WHERE id = :aid FOR UPDATE"),
+        {"aid": data.appointment_id},
+    )
+
+    # Re-buscar dentro do lock para garantir estado atualizado
+    appointment = db.query(Appointment).filter(
+        Appointment.id == data.appointment_id
+    ).first()
+
+    if appointment.status not in ["awaiting_payment", "pending"]:
+        if idem_record:
+            idem_record.status = "failed"
+            db.commit()
+        raise HTTPException(status_code=400, detail="Agendamento não está aguardando pagamento")
+
+    # Verificar pagamento completo dentro do lock
     existing_paid = db.query(Payment).filter(
         Payment.appointment_id == data.appointment_id,
         Payment.status == "completed",
     ).first()
     if existing_paid:
+        if idem_record:
+            idem_record.status = "failed"
+            db.commit()
         raise HTTPException(status_code=400, detail="Agendamento já foi pago")
 
-    if not (1 <= data.installments <= 12):
-        raise HTTPException(status_code=400, detail="Número de parcelas inválido (deve ser entre 1 e 12)")
+    # Remover payments "failed" anteriores para liberar a UniqueConstraint
+    # (failed = recusado pelo MP — não gera cobrança, pode tentar novamente)
+    db.query(Payment).filter(
+        Payment.appointment_id == data.appointment_id,
+        Payment.status == "failed",
+    ).delete(synchronize_session=False)
 
     try:
         mp_result = create_card_payment(
@@ -258,8 +355,11 @@ async def create_card(
             description=f"Dentista Facil - Consulta #{str(appointment.id)[:8]}",
         )
     except ValueError as e:
+        # MP recusou antes mesmo de criar o pagamento — liberar a idem key
+        if idem_record:
+            idem_record.status = "failed"
+            db.commit()
         error_str = str(e)
-        # Cartão internacional sem suporte a parcelamento
         if "INTERNATIONAL_NO_INSTALLMENTS" in error_str:
             raise HTTPException(
                 status_code=422,
@@ -272,7 +372,6 @@ async def create_card(
                     "can_retry_with_1x": data.installments > 1,
                 },
             )
-        # Bandeira/emissor não suporta as parcelas solicitadas
         if "INSTALLMENTS_NOT_SUPPORTED" in error_str:
             raise HTTPException(
                 status_code=422,
@@ -286,6 +385,13 @@ async def create_card(
                 },
             )
         raise HTTPException(status_code=502, detail=error_str)
+    except Exception as e:
+        # Erro inesperado — liberar a idem key para não bloquear retentativas
+        if idem_record:
+            idem_record.status = "failed"
+            db.commit()
+        logging.exception("[card] Erro inesperado ao chamar MP | appointment=%s", data.appointment_id)
+        raise HTTPException(status_code=500, detail="Erro interno ao processar pagamento.")
 
     # ── Mapeamento completo status_detail → (categoria, mensagem amigável) ────
     # Cobre todos os status_detail documentados pelo Mercado Pago.
@@ -408,17 +514,35 @@ async def create_card(
     )
     db.add(payment)
 
+    # Flush imediato para disparar a UniqueConstraint antes do commit.
+    # Se duas requisições simultâneas chegaram aqui (o FOR UPDATE deveria ter
+    # impedido, mas este é o fallback), apenas uma vai conseguir o flush.
+    try:
+        db.flush()
+    except IntegrityError:
+        db.rollback()
+        if idem_record:
+            idem_record.status = "failed"
+            try:
+                db.commit()
+            except Exception:
+                pass
+        logging.warning(
+            "[card] UniqueConstraint disparada (pagamento duplicado bloqueado pelo banco) "
+            "| appointment=%s", data.appointment_id
+        )
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code":    "DUPLICATE_PAYMENT_BLOCKED",
+                "message": "Este agendamento já possui um pagamento em andamento. Verifique seus agendamentos.",
+            },
+        )
+
     # ── Aprovado ──────────────────────────────────────────────────────────────
     if mp_status == "approved":
         _confirm_appointment_paid(db, appointment, payment)
-        background_tasks.add_task(
-            _notify_patient_ws,
-            str(user.id),
-            str(appointment.id),
-            str(payment.id),
-            float(payment.amount),
-        )
-        return {
+        response_body = {
             "payment_id":    payment.id,
             "status":        "completed",
             "status_detail": status_detail,
@@ -426,15 +550,26 @@ async def create_card(
             "message":       "Pagamento aprovado! Consulta confirmada.",
             "amount":        payment.amount,
         }
+        if idem_record:
+            idem_record.payment_id = payment.id
+            idem_record.status     = "done"
+            idem_record.response   = json.dumps(response_body)
+        background_tasks.add_task(
+            _notify_patient_ws,
+            str(user.id),
+            str(appointment.id),
+            str(payment.id),
+            float(payment.amount),
+        )
+        return response_body
 
     # ── Em análise / pendente ─────────────────────────────────────────────────
     elif mp_status in ["in_process", "pending"]:
-        db.commit()
         _, friendly_msg = STATUS_DETAIL_MAP.get(
             status_detail,
             ("in_process", "Pagamento em análise. Você será notificado em breve."),
         )
-        return {
+        response_body = {
             "payment_id":    payment.id,
             "status":        mp_status,
             "status_detail": status_detail,
@@ -442,29 +577,37 @@ async def create_card(
             "message":       friendly_msg,
             "amount":        payment.amount,
         }
+        if idem_record:
+            idem_record.payment_id = payment.id
+            idem_record.status     = "done"
+            idem_record.response   = json.dumps(response_body)
+        db.commit()
+        return response_body
 
     # ── Recusado ──────────────────────────────────────────────────────────────
     else:
-        db.commit()
         category, friendly_msg = STATUS_DETAIL_MAP.get(
             status_detail,
             ("rejected", "Cartão recusado. Use outro cartão ou tente o PIX."),
         )
-        # user_fixable = true → erro nos dados do formulário (usuário pode corrigir)
         user_fixable = category == "rejected_fixable"
-        # suggest_1x = true → problema com parcelas (pode tentar em 1x)
-        suggest_1x = category == "rejected_installments" and data.installments > 1
+        suggest_1x   = category == "rejected_installments" and data.installments > 1
 
-        raise HTTPException(
-            status_code=402,
-            detail={
-                "code":          status_detail or "cc_rejected_other_reason",
-                "category":      category,
-                "message":       friendly_msg,
-                "user_fixable":  user_fixable,
-                "suggest_1x":    suggest_1x,
-            },
-        )
+        error_detail = {
+            "code":          status_detail or "cc_rejected_other_reason",
+            "category":      category,
+            "message":       friendly_msg,
+            "user_fixable":  user_fixable,
+            "suggest_1x":    suggest_1x,
+        }
+        # Pagamento recusado: NÃO salvar na idempotência — usuário pode
+        # corrigir os dados e tentar novamente com a mesma chave ou uma nova.
+        # Apenas marcar como failed para não bloquear retentativas legítimas.
+        if idem_record:
+            idem_record.status = "failed"
+        db.commit()
+
+        raise HTTPException(status_code=402, detail=error_detail)
 
 
 # ==========================================

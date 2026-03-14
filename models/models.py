@@ -226,6 +226,38 @@ class Payment(Base):
     refunded_at = Column(DateTime)
     appointment = relationship("Appointment", back_populates="payments")
 
+    # Garante no banco que só existe 1 payment ativo por agendamento.
+    # A constraint de aplicação (SELECT FOR UPDATE) é a primeira linha de defesa;
+    # esta UniqueConstraint é a rede de segurança final no nível do banco.
+    # Payments com status "failed" são excluídos via lógica de aplicação antes
+    # de criar um novo (ver router de pagamentos).
+    __table_args__ = (
+        UniqueConstraint(
+            "appointment_id",
+            name="uq_payment_appointment_active",
+        ),
+    )
+
+
+class PaymentIdempotency(Base):
+    """
+    Tabela de idempotência para pagamentos com cartão.
+
+    O frontend gera um idempotency_key (UUID v4) antes de chamar POST /payments/card.
+    Se a mesma key chegar duas vezes (duplo clique, retry automático), o segundo
+    pedido recebe o mesmo resultado do primeiro sem chamar o Mercado Pago novamente.
+
+    TTL: 30 minutos.
+    """
+    __tablename__ = "payment_idempotency"
+    key        = Column(String, primary_key=True)           # UUID enviado pelo frontend
+    payment_id = Column(String, nullable=True)              # preenchido após criação
+    status     = Column(String, nullable=False)             # "processing" | "done" | "failed"
+    response   = Column(Text)                               # JSON do response serializado
+    created_at = Column(DateTime, default=datetime.utcnow)
+    expires_at = Column(DateTime, nullable=False)           # created_at + 30 min
+
+
 class ClinicReview(Base):
     __tablename__ = "clinic_reviews"
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
