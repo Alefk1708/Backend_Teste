@@ -266,7 +266,7 @@ async def create_card(
 
         if existing_idem:
             if existing_idem.status == "processing":
-                # Outra requisição está em andamento com a mesma key agora mesmo
+                # Outra requisição simultânea com a mesma key está em andamento
                 raise HTTPException(
                     status_code=409,
                     detail={
@@ -274,33 +274,44 @@ async def create_card(
                         "message": "Pagamento já está sendo processado. Aguarde.",
                     },
                 )
-            if existing_idem.status in ("done", "failed") and existing_idem.response:
-                # Retornar resposta idempotente armazenada
+            if existing_idem.status == "done" and existing_idem.response:
+                # Retornar resposta idempotente já armazenada (duplo clique, retry)
                 logging.info(
                     "[card] Idempotência: retornando resposta salva | key=%s",
                     data.idempotency_key,
                 )
                 return json.loads(existing_idem.response)
 
-        # Registrar a key como "processing" antes de qualquer operação
-        idem_record = PaymentIdempotency(
-            key=data.idempotency_key,
-            status="processing",
-            created_at=now,
-            expires_at=now + timedelta(minutes=30),
-        )
-        db.add(idem_record)
-        try:
-            db.flush()  # inserir imediatamente para que outros requests vejam
-        except Exception:
-            db.rollback()
-            raise HTTPException(
-                status_code=409,
-                detail={
-                    "code": "PAYMENT_IN_PROGRESS",
-                    "message": "Pagamento já está sendo processado. Aguarde.",
-                },
+            # status == "failed" (com ou sem response): a tentativa anterior
+            # falhou — reutilizar o mesmo registro atualizando para "processing"
+            # em vez de tentar inserir um novo (o que causaria conflito de PK)
+            existing_idem.status     = "processing"
+            existing_idem.response   = None
+            existing_idem.payment_id = None
+            existing_idem.expires_at = now + timedelta(minutes=30)
+            db.flush()
+            idem_record = existing_idem
+
+        else:
+            # Primeira vez que esta key aparece — criar o registro
+            idem_record = PaymentIdempotency(
+                key=data.idempotency_key,
+                status="processing",
+                created_at=now,
+                expires_at=now + timedelta(minutes=30),
             )
+            db.add(idem_record)
+            try:
+                db.flush()
+            except Exception:
+                db.rollback()
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "PAYMENT_IN_PROGRESS",
+                        "message": "Pagamento já está sendo processado. Aguarde.",
+                    },
+                )
     else:
         idem_record = None
 
