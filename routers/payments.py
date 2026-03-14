@@ -287,12 +287,112 @@ async def create_card(
             )
         raise HTTPException(status_code=502, detail=error_str)
 
-    mp_status = mp_result["status"]
+    # ── Mapeamento completo status_detail → (categoria, mensagem amigável) ────
+    # Cobre todos os status_detail documentados pelo Mercado Pago.
+    # Ref: https://www.mercadopago.com.br/developers/pt/docs/checkout-api/response-handling/collection-results
+    STATUS_DETAIL_MAP = {
+        # ── Aprovado ──────────────────────────────────────────────────────────
+        "accredited": (
+            "approved",
+            "Pagamento aprovado! Consulta confirmada.",
+        ),
+        # ── Pendente / em análise ─────────────────────────────────────────────
+        "pending_contingency": (
+            "in_process",
+            "Pagamento em análise. Você será notificado em até 2 dias úteis.",
+        ),
+        "pending_review_manual": (
+            "in_process",
+            "Pagamento em revisão manual. Retorno em até 2 dias úteis.",
+        ),
+        "pending_waiting_payment": (
+            "pending",
+            "Aguardando confirmação do pagamento.",
+        ),
+        "pending_waiting_transfer": (
+            "pending",
+            "Aguardando transferência bancária.",
+        ),
+        # ── Recusados — dados incorretos (usuário pode corrigir) ──────────────
+        "cc_rejected_bad_filled_security_code": (
+            "rejected_fixable",
+            "CVV inválido. Confira o código de segurança no verso do cartão.",
+        ),
+        "cc_rejected_bad_filled_date": (
+            "rejected_fixable",
+            "Data de validade inválida. Verifique o mês e o ano.",
+        ),
+        "cc_rejected_bad_filled_card_number": (
+            "rejected_fixable",
+            "Número do cartão inválido. Confira os 16 dígitos.",
+        ),
+        "cc_rejected_bad_filled_other": (
+            "rejected_fixable",
+            "Dado inválido no formulário. Confira as informações e tente novamente.",
+        ),
+        # ── Recusados — banco bloqueia / limite ───────────────────────────────
+        "cc_rejected_call_for_authorize": (
+            "rejected_call_bank",
+            "Transação bloqueada pelo banco. Ligue para o número no verso do cartão e autorize a compra.",
+        ),
+        "cc_rejected_insufficient_amount": (
+            "rejected_no_funds",
+            "Saldo insuficiente. Verifique o limite disponível ou use outro cartão.",
+        ),
+        "cc_rejected_max_attempts": (
+            "rejected_blocked",
+            "Tentativas excedidas. Por segurança aguarde 24h ou use outro cartão.",
+        ),
+        # ── Recusados — cartão bloqueado / problema permanente ────────────────
+        "cc_rejected_blacklist": (
+            "rejected_blocked",
+            "Cartão não autorizado pelo emissor. Use outro cartão ou tente o PIX.",
+        ),
+        "cc_rejected_card_disabled": (
+            "rejected_blocked",
+            "Cartão desabilitado. Entre em contato com seu banco.",
+        ),
+        "cc_rejected_disabled_payment_method": (
+            "rejected_blocked",
+            "Este tipo de cartão não está habilitado. Tente outro cartão.",
+        ),
+        "cc_rejected_high_risk": (
+            "rejected_blocked",
+            "Transação recusada por segurança. Tente outro método de pagamento.",
+        ),
+        "cc_rejected_card_type_not_allowed": (
+            "rejected_blocked",
+            "Tipo de cartão não aceito (débito/crédito). Tente com outro cartão.",
+        ),
+        # ── Recusados — parcelas / configuração ───────────────────────────────
+        "cc_rejected_invalid_installments": (
+            "rejected_installments",
+            "Número de parcelas inválido para este cartão. Tente pagar em 1x.",
+        ),
+        "cc_rejected_empty_installments": (
+            "rejected_installments",
+            "Parcelamento não disponível para este cartão. Tente pagar em 1x.",
+        ),
+        # ── Recusados — duplicidade ───────────────────────────────────────────
+        "cc_rejected_duplicated_payment": (
+            "rejected_duplicate",
+            "Pagamento duplicado detectado. Verifique seus pagamentos antes de tentar novamente.",
+        ),
+        # ── Genérico ──────────────────────────────────────────────────────────
+        "cc_rejected_other_reason": (
+            "rejected",
+            "Cartão recusado pelo banco. Use outro cartão ou tente o PIX.",
+        ),
+    }
+
+    mp_status     = mp_result["status"]
+    status_detail = mp_result.get("status_detail", "")
+
     internal_status = {
-        "approved": "completed",
+        "approved":   "completed",
         "in_process": "pending",
-        "rejected": "failed",
-        "pending": "pending",
+        "rejected":   "failed",
+        "pending":    "pending",
     }.get(mp_status, "pending")
 
     payment = Payment(
@@ -308,6 +408,7 @@ async def create_card(
     )
     db.add(payment)
 
+    # ── Aprovado ──────────────────────────────────────────────────────────────
     if mp_status == "approved":
         _confirm_appointment_paid(db, appointment, payment)
         background_tasks.add_task(
@@ -318,36 +419,52 @@ async def create_card(
             float(payment.amount),
         )
         return {
-            "payment_id": payment.id,
-            "status": "completed",
-            "is_approved": True,
-            "message": "Pagamento aprovado! Consulta confirmada.",
-            "amount": payment.amount,
+            "payment_id":    payment.id,
+            "status":        "completed",
+            "status_detail": status_detail,
+            "is_approved":   True,
+            "message":       "Pagamento aprovado! Consulta confirmada.",
+            "amount":        payment.amount,
         }
 
-    elif mp_status == "in_process":
+    # ── Em análise / pendente ─────────────────────────────────────────────────
+    elif mp_status in ["in_process", "pending"]:
         db.commit()
+        _, friendly_msg = STATUS_DETAIL_MAP.get(
+            status_detail,
+            ("in_process", "Pagamento em análise. Você será notificado em breve."),
+        )
         return {
-            "payment_id": payment.id,
-            "status": "in_process",
-            "is_approved": False,
-            "message": "Pagamento em analise. Voce sera notificado em breve.",
-            "amount": payment.amount,
+            "payment_id":    payment.id,
+            "status":        mp_status,
+            "status_detail": status_detail,
+            "is_approved":   False,
+            "message":       friendly_msg,
+            "amount":        payment.amount,
         }
 
-    else:  # rejected
+    # ── Recusado ──────────────────────────────────────────────────────────────
+    else:
         db.commit()
-        status_detail = mp_result.get("status_detail", "")
-        detail_messages = {
-            "cc_rejected_insufficient_amount": "Saldo insuficiente no cartao.",
-            "cc_rejected_bad_filled_card_number": "Numero do cartao invalido.",
-            "cc_rejected_bad_filled_date": "Data de validade invalida.",
-            "cc_rejected_bad_filled_security_code": "CVV invalido.",
-            "cc_rejected_call_for_authorize": "Cartao bloqueado. Contate seu banco.",
-            "cc_rejected_blacklist": "Cartao nao autorizado.",
-        }
-        user_message = detail_messages.get(status_detail, "Cartao recusado. Tente outro cartao ou PIX.")
-        raise HTTPException(status_code=402, detail=user_message)
+        category, friendly_msg = STATUS_DETAIL_MAP.get(
+            status_detail,
+            ("rejected", "Cartão recusado. Use outro cartão ou tente o PIX."),
+        )
+        # user_fixable = true → erro nos dados do formulário (usuário pode corrigir)
+        user_fixable = category == "rejected_fixable"
+        # suggest_1x = true → problema com parcelas (pode tentar em 1x)
+        suggest_1x = category == "rejected_installments" and data.installments > 1
+
+        raise HTTPException(
+            status_code=402,
+            detail={
+                "code":          status_detail or "cc_rejected_other_reason",
+                "category":      category,
+                "message":       friendly_msg,
+                "user_fixable":  user_fixable,
+                "suggest_1x":    suggest_1x,
+            },
+        )
 
 
 # ==========================================
