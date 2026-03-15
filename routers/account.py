@@ -96,7 +96,7 @@ def request_update_code(background_tasks: BackgroundTasks, db: Session = Depends
     ).delete()
     db.commit()
 
-    code, expire = code_generator()
+    code, expire = code_generator(auth_user.email)
 
     db.add(TwoFactorAuth(
         entity_id=str(auth_user.id),
@@ -215,7 +215,7 @@ def request_delete_code(
     db.commit()
     
     # Gerar novo código
-    code, expire = code_generator()
+    code, expire = code_generator(auth_user.email)
     
     # Salvar com tipo específico para delete
     db.add(TwoFactorAuth(

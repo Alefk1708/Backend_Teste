@@ -14,7 +14,28 @@ SMTP_PORT = int(os.getenv("SMTP_PORT", 587))
 SMTP_EMAIL = os.getenv("SMTP_EMAIL")
 SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
 
-def code_generator():
+# Emails de contas de teste — recebem sempre o código fixo "000000"
+# e o envio de email é ignorado automaticamente em seed_email_code.
+TEST_EMAILS = {
+    "admin.teste@dentistafacil.dev",
+    "clinica.teste@dentistafacil.dev",
+    "paciente.teste@dentistafacil.dev",
+}
+
+def is_test_account(email: str) -> bool:
+    """Retorna True se o email pertence a uma conta de teste."""
+    return email.lower() in TEST_EMAILS
+
+
+def code_generator(email: str = "") -> tuple[str, datetime]:
+    """
+    Gera código de verificação e data de expiração.
+    Para contas de teste, retorna sempre "000000".
+    """
+    if is_test_account(email):
+        expira = datetime.utcnow() + timedelta(minutes=10)
+        return "000000", expira
+
     codigo = str(secrets.randbelow(1000000)).zfill(6)
     expira = datetime.utcnow() + timedelta(minutes=10)
     return codigo, expira
@@ -133,6 +154,10 @@ HTML_TEMPLATE = """ <!DOCTYPE html>
 </html> """
 
 def seed_email_code(email: str, code: str, minutes: int):
+    # Contas de teste não recebem email — o código fixo "000000" já é conhecido.
+    if is_test_account(email):
+        print(f"[TEST] seed_email_code ignorado para {email} (código fixo: 000000)")
+        return
 
     html = HTML_TEMPLATE \
         .replace("{{CODE}}", code) \

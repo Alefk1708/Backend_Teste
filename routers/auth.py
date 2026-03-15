@@ -193,7 +193,7 @@ def acess_account(user: UserAcess, background_tasks: BackgroundTasks ,db: Sessio
     ).delete()
     db.commit()
 
-    code, expire = code_generator()
+    code, expire = code_generator(user.email)
 
     db.add(TwoFactorAuth(
         entity_id=str(account.id),
@@ -246,7 +246,7 @@ def reseed_verify_code(data: ResetCode, background_tasks: BackgroundTasks, db: S
     ).delete()
     db.commit()
 
-    code, expire = code_generator()
+    code, expire = code_generator(data.email)
 
     db.add(TwoFactorAuth(
         entity_id=str(account.id),
@@ -346,7 +346,7 @@ def seed_reset_code(data: ResetCode, background_tasks: BackgroundTasks, db: Sess
     ).delete()
     db.commit()
 
-    code, expire = code_generator()
+    code, expire = code_generator(data.email)
 
     db.add(ResetPasswordWithCode(
         entity_id=str(account.id),
