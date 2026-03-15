@@ -14,13 +14,41 @@ from datetime import datetime
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 from database import get_db
-from models.models import Appointment, Notification, User, Clinic
+from models.models import Appointment, Notification, User, Clinic, AppointmentSlot
 import uuid, json
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["payment_expiry"])
 
 PAYMENT_LIMIT_HOURS = 1  # limite em horas para pagar
+
+
+def _release_expired_slot_reservations(db: Session) -> int:
+    """
+    Libera reservas temporárias de slots que expiraram (10 minutos).
+    Chamado junto com o loop de cancelamento de pagamentos.
+    """
+    now = datetime.utcnow()
+    expired_slots = db.query(AppointmentSlot).filter(
+        AppointmentSlot.status == "reserved",
+        AppointmentSlot.reservation_expires_at != None,
+        AppointmentSlot.reservation_expires_at < now,
+    ).all()
+
+    released = 0
+    for slot in expired_slots:
+        slot.status = "available"
+        slot.reserved_by = None
+        slot.reserved_at = None
+        slot.reservation_expires_at = None
+        slot.walk_in_patient_name = None
+        released += 1
+
+    if released:
+        db.commit()
+        logger.info(f"[payment_expiry] {released} reserva(s) de slot expirada(s) liberada(s)")
+
+    return released
 
 
 def _cancel_expired(db: Session) -> int:
@@ -43,6 +71,20 @@ def _cancel_expired(db: Session) -> int:
             f"Cancelada automaticamente: pagamento não realizado "
             f"dentro do prazo de {PAYMENT_LIMIT_HOURS}h."
         )
+
+        # Liberar o slot vinculado (se existir)
+        try:
+            slot = db.query(AppointmentSlot).filter(
+                AppointmentSlot.appointment_id == appt.id,
+            ).first()
+            if slot and slot.status in ("reserved", "confirmed"):
+                slot.status = "available"
+                slot.appointment_id = None
+                slot.reserved_by = None
+                slot.reserved_at = None
+                slot.reservation_expires_at = None
+        except Exception:
+            pass
 
         # Notificar paciente
         try:
@@ -112,6 +154,7 @@ async def start_expiry_loop():
         try:
             db = SessionLocal()
             _cancel_expired(db)
+            _release_expired_slot_reservations(db)
         except Exception as e:
             logger.error(f"[payment_expiry] erro no loop: {e}")
         finally:

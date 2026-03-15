@@ -825,6 +825,130 @@ def get_financial_reports(
         recentTransactions=transactions_list
     )
 
+
+@router.get("/financial/pending-refunds")
+def get_pending_refunds(
+    db: Session = Depends(get_db),
+    current_user=Depends(require_admin),
+):
+    """
+    Lista todos os pagamentos com status 'pending_refund' —
+    ou seja, cancelamentos em que o reembolso automático no Mercado Pago falhou
+    e precisam de ação manual do administrador.
+    """
+    rows = (
+        db.query(Payment, Appointment, User)
+        .join(Appointment, Payment.appointment_id == Appointment.id)
+        .join(User, Appointment.patient_id == User.id)
+        .filter(Payment.status == "pending_refund")
+        .order_by(Payment.created_at.desc())
+        .all()
+    )
+
+    return [
+        {
+            "payment_id":      pay.id,
+            "appointment_id":  pay.appointment_id,
+            "external_id":     pay.external_id,
+            "amount":          float(pay.amount),
+            "payment_method":  pay.payment_method,
+            "created_at":      pay.created_at.isoformat() if pay.created_at else None,
+            "cancelled_at":    appt.completed_at.isoformat() if appt.completed_at else None,
+            "cancellation_reason": appt.cancellation_reason,
+            "patient_name":    patient.name,
+            "patient_email":   patient.email,
+        }
+        for pay, appt, patient in rows
+    ]
+
+
+@router.post("/financial/pending-refunds/{payment_id}/process")
+def process_pending_refund(
+    payment_id: str,
+    db: Session = Depends(get_db),
+    current_user=Depends(require_admin),
+):
+    """
+    Tenta reembolsar manualmente um pagamento marcado como 'pending_refund'.
+    Chama o Mercado Pago de verdade. Se sucesso → status 'refunded'.
+    """
+    from services.mercadopago_service import refund_payment as mp_refund
+    import logging
+
+    payment = db.query(Payment).filter(
+        Payment.id == payment_id,
+        Payment.status == "pending_refund",
+    ).first()
+
+    if not payment:
+        raise HTTPException(
+            status_code=404,
+            detail="Pagamento não encontrado ou não está pendente de reembolso.",
+        )
+
+    if not payment.external_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Este pagamento não possui ID externo do Mercado Pago. Reembolso deve ser feito manualmente no painel do MP.",
+        )
+
+    try:
+        mp_refund(payment.external_id)
+        payment.status = "refunded"
+        payment.refunded_at = datetime.utcnow()
+        db.commit()
+        logging.info(
+            "[admin] Reembolso manual realizado | payment=%s | external_id=%s | admin=%s",
+            payment_id, payment.external_id, current_user["user"].id,
+        )
+        return {
+            "success": True,
+            "message": "Reembolso processado com sucesso no Mercado Pago.",
+            "payment_id": payment_id,
+        }
+    except Exception as exc:
+        logging.error(
+            "[admin] Falha no reembolso manual | payment=%s | erro=%s",
+            payment_id, exc,
+        )
+        raise HTTPException(
+            status_code=502,
+            detail=f"Falha ao processar reembolso no Mercado Pago: {str(exc)}",
+        )
+
+
+@router.patch("/financial/pending-refunds/{payment_id}/mark-done")
+def mark_refund_done_manually(
+    payment_id: str,
+    db: Session = Depends(get_db),
+    current_user=Depends(require_admin),
+):
+    """
+    Marca um reembolso como concluído manualmente — para casos em que o admin
+    fez o estorno diretamente no painel do Mercado Pago ou por outro meio.
+    """
+    payment = db.query(Payment).filter(
+        Payment.id == payment_id,
+        Payment.status == "pending_refund",
+    ).first()
+
+    if not payment:
+        raise HTTPException(
+            status_code=404,
+            detail="Pagamento não encontrado ou não está pendente de reembolso.",
+        )
+
+    payment.status = "refunded"
+    payment.refunded_at = datetime.utcnow()
+    db.commit()
+
+    return {
+        "success": True,
+        "message": "Reembolso marcado como concluído manualmente.",
+        "payment_id": payment_id,
+    }
+
+
 # ========== SUPORTE / TICKETS ==========
 
 MOCK_TICKETS = [

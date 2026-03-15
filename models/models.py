@@ -1,4 +1,4 @@
-from sqlalchemy import Column, String, DateTime, Integer, Float, Boolean, ForeignKey, Text, UniqueConstraint
+from sqlalchemy import Column, String, DateTime, Integer, Float, Boolean, ForeignKey, Text, UniqueConstraint, Date, Time
 from sqlalchemy.orm import relationship
 from datetime import datetime
 from database import Base
@@ -385,3 +385,90 @@ class TreatmentSuggestion(Base):
     procedure = relationship("Procedure")
     patient = relationship("User")
     
+
+# ═══════════════════════════════════════════════════════════
+# AGENDA POR SLOTS
+# Fluxo: WorkSchedule (regra) → AppointmentSlot (horários)
+# Status: available → reserved (10min) → confirmed → waiting → completed
+#         available → occupied (walk-in presencial)
+# ═══════════════════════════════════════════════════════════
+
+class WorkSchedule(Base):
+    """
+    Regra de funcionamento da clínica por dia da semana.
+    O admin define e o sistema gera os slots automaticamente.
+    """
+    __tablename__ = "work_schedules"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    clinic_id = Column(String, ForeignKey("clinics.id"), nullable=False)
+
+    # 0 = Segunda-feira ... 6 = Domingo
+    day_of_week = Column(Integer, nullable=False)
+
+    # Strings "HH:MM" para simplicidade cross-DB
+    start_time = Column(String(5), nullable=False)   # ex: "09:00"
+    end_time   = Column(String(5), nullable=False)   # ex: "18:00"
+    lunch_start = Column(String(5), nullable=True)   # ex: "12:00" (opcional)
+    lunch_end   = Column(String(5), nullable=True)   # ex: "13:00"
+
+    slot_duration_minutes = Column(Integer, default=30)
+    is_active = Column(Boolean, default=True)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("clinic_id", "day_of_week", name="uq_work_schedule_clinic_day"),
+    )
+
+
+class AppointmentSlot(Base):
+    """
+    Slot individual de horário gerado a partir das WorkSchedules.
+
+    status:
+      available  → livre para agendamento pelo app
+      reserved   → paciente escolheu, aguardando pagamento (10 min)
+      confirmed  → pagamento aprovado
+      waiting    → paciente chegou (check-in na recepção)
+      in_progress→ está sendo atendido
+      completed  → consulta finalizada
+      occupied   → bloqueado pela clínica (encaixe presencial / folga)
+      cancelled  → cancelado (pagamento expirou ou manual)
+    """
+    __tablename__ = "appointment_slots"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    clinic_id = Column(String, ForeignKey("clinics.id"), nullable=False)
+
+    # Data e horários
+    slot_date  = Column(Date, nullable=False)
+    start_time = Column(DateTime, nullable=False)
+    end_time   = Column(DateTime, nullable=False)
+
+    # Status principal
+    status = Column(String, default="available", index=True)
+
+    # Reserva temporária (10 minutos)
+    reserved_by          = Column(String, ForeignKey("users.id"), nullable=True)
+    reserved_at          = Column(DateTime, nullable=True)
+    reservation_expires_at = Column(DateTime, nullable=True)
+
+    # Agendamento gerado ao confirmar pagamento
+    appointment_id = Column(String, ForeignKey("appointments.id"), nullable=True)
+
+    # Encaixe presencial (opcional: nome do paciente balcão)
+    walk_in_patient_name = Column(String, nullable=True)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    # Índice composto para busca rápida de slots disponíveis por clínica+data
+    __table_args__ = (
+        UniqueConstraint("clinic_id", "start_time", name="uq_slot_clinic_start"),
+    )
+
+    clinic = relationship("Clinic")
+    reserved_user = relationship("User", foreign_keys=[reserved_by])
+    appointment = relationship("Appointment", foreign_keys=[appointment_id])

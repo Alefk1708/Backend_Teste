@@ -57,9 +57,10 @@ class SuggestionCreate(BaseModel):
 
 
 class SuggestionAccept(BaseModel):
-    scheduled_at: datetime       # Data escolhida pelo paciente
+    scheduled_at: datetime         # Data/hora escolhida pelo paciente
     patient_latitude: float
     patient_longitude: float
+    slot_id: Optional[str] = None  # Se informado, o slot é vinculado ao agendamento gerado
 
 
 # ==========================================
@@ -372,6 +373,22 @@ def accept_suggestion(
     suggestion.status = "accepted"
     suggestion.resulting_appointment_id = new_appointment.id
     suggestion.responded_at = datetime.utcnow()
+
+    # ── Vincular slot ao agendamento (se slot_id foi fornecido) ──────────
+    if data.slot_id:
+        from models.models import AppointmentSlot
+        slot = db.query(AppointmentSlot).filter(
+            AppointmentSlot.id == data.slot_id,
+            AppointmentSlot.clinic_id == suggestion.clinic_id,
+            AppointmentSlot.reserved_by == str(user.id),
+            AppointmentSlot.status == "reserved",
+        ).first()
+        if slot:
+            slot.status = "confirmed"
+            slot.appointment_id = new_appointment.id
+            slot.reserved_by = None
+            slot.reservation_expires_at = None
+        # Se slot não encontrado, não bloqueia o fluxo — apenas segue sem slot
 
     # Notificar clínica
     notification = Notification(

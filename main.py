@@ -18,6 +18,7 @@ import routers.suggestions
 import routers.notifications
 import routers.support
 import routers.payment_expiry
+import routers.slots
 
 Base.metadata.create_all(bind=engine)
 
@@ -45,6 +46,7 @@ app.include_router(routers.suggestions.router)
 app.include_router(routers.notifications.router)
 app.include_router(routers.support.router)
 app.include_router(routers.payment_expiry.router)
+app.include_router(routers.slots.router)
 
 @app.on_event("startup")
 async def startup_event():
@@ -64,6 +66,7 @@ async def root():
             "appointments": "/appointments",
             "payments": "/payments",
             "suggestions": "/suggestions",
+            "slots": "/slots",
         }
     }
 

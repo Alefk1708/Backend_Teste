@@ -15,7 +15,6 @@ from core.security import get_current_user
 from models.models import (
     Clinic, ClinicProcedure, Procedure, Appointment,
     EmergencyRequest, ClinicReview, ClinicEmergencyPrice,
-    AppointmentSlot,
     PlatformEmergencyPrice,
 )
 from typing import Optional
@@ -266,51 +265,29 @@ def get_clinic_dashboard_stats(
     if not clinic:
         raise HTTPException(status_code=404, detail="Clínica não encontrada")
 
-    from datetime import timedelta, date as date_type
+    from datetime import timedelta
     today = datetime.utcnow().date()
     today_start = datetime.combine(today, datetime.min.time())
-    today_end   = datetime.combine(today, datetime.max.time())
-
-    # ── Agendamentos de hoje (todos os status ativos + concluídos + aguardando pagamento) ─────────
-    # "awaiting_payment" é incluído pois o slot já está reservado — o paciente só não pagou ainda.
-    ACTIVE_STATUSES = ["awaiting_payment", "confirmed", "waiting", "in_progress", "completed"]
+    today_end = datetime.combine(today, datetime.max.time())
 
     today_appointments = db.query(Appointment).filter(
         Appointment.clinic_id == user.id,
         Appointment.scheduled_at >= today_start,
         Appointment.scheduled_at <= today_end,
-        Appointment.status.in_(ACTIVE_STATUSES),
+        Appointment.status.in_(["confirmed", "completed"]),
     ).count()
 
-    # ── Faturamento do dia (somente concluídos) ────────────────────────────
-    # Usa completed_at para capturar urgências e atendimentos concluídos hoje,
-    # independente de quando foram agendados.
     today_revenue = (
         db.query(func.sum(Appointment.clinic_amount))
         .filter(
             Appointment.clinic_id == user.id,
-            Appointment.completed_at >= today_start,
-            Appointment.completed_at <= today_end,
+            Appointment.scheduled_at >= today_start,
+            Appointment.scheduled_at <= today_end,
             Appointment.status == "completed",
         )
         .scalar() or 0
     )
 
-    # ── Faturamento do mês ────────────────────────────────────────────────
-    month_start = datetime.combine(
-        today.replace(day=1), datetime.min.time()
-    )
-    month_revenue = (
-        db.query(func.sum(Appointment.clinic_amount))
-        .filter(
-            Appointment.clinic_id == user.id,
-            Appointment.completed_at >= month_start,
-            Appointment.status == "completed",
-        )
-        .scalar() or 0
-    )
-
-    # ── Urgências pendentes ────────────────────────────────────────────────
     pending_requests = 0
     if clinic.is_online and clinic.emergency_enabled:
         pending_requests = db.query(EmergencyRequest).filter(
@@ -318,58 +295,17 @@ def get_clinic_dashboard_stats(
             EmergencyRequest.expires_at > datetime.utcnow(),
         ).count()
 
-    # ── Avaliação média ────────────────────────────────────────────────────
     avg_rating = (
         db.query(func.avg(ClinicReview.rating))
         .filter(ClinicReview.clinic_id == user.id)
         .scalar() or 4.5
     )
 
-    total_reviews = db.query(ClinicReview).filter(
-        ClinicReview.clinic_id == user.id
-    ).count()
-
-    # ── Slots de hoje (resumo por status) ─────────────────────────────────
-    today_slots = db.query(AppointmentSlot).filter(
-        AppointmentSlot.clinic_id == user.id,
-        AppointmentSlot.slot_date == today,
-    ).all()
-
-    slots_summary = {
-        "total": len(today_slots),
-        "available":   sum(1 for s in today_slots if s.status == "available"),
-        "reserved":    sum(1 for s in today_slots if s.status == "reserved"),
-        "confirmed":   sum(1 for s in today_slots if s.status == "confirmed"),
-        "waiting":     sum(1 for s in today_slots if s.status == "waiting"),
-        "in_progress": sum(1 for s in today_slots if s.status == "in_progress"),
-        "occupied":    sum(1 for s in today_slots if s.status == "occupied"),
-        "completed":   sum(1 for s in today_slots if s.status == "completed"),
-    }
-
-    # ── Agendamentos confirmados futuros (próximos 7 dias) ─────────────────
-    upcoming = db.query(Appointment).filter(
-        Appointment.clinic_id == user.id,
-        Appointment.scheduled_at > today_end,
-        Appointment.scheduled_at <= today_end + timedelta(days=7),
-        Appointment.status.in_(["confirmed", "awaiting_payment"]),
-    ).count()
-
     return {
-        # Indicadores principais (usados pelos StatCards)
         "today_appointments": today_appointments,
         "today_revenue": round(float(today_revenue), 2),
         "pending_requests": pending_requests,
         "rating": round(float(avg_rating), 1),
-
-        # Informações extras
-        "total_reviews": total_reviews,
-        "month_revenue": round(float(month_revenue), 2),
-        "upcoming_7days": upcoming,
-
-        # Resumo dos slots de hoje
-        "slots_today": slots_summary,
-
-        # Status da clínica
         "is_online": clinic.is_online,
         "is_active": clinic.is_active,
         "emergency_enabled": clinic.emergency_enabled,

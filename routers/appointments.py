@@ -11,14 +11,16 @@ from core.security import get_current_user
 from models.models import (
     User, Clinic, Appointment, EmergencyRequest, Procedure, 
     ClinicProcedure, Payment, Notification, ClinicEmergencyPrice,
-    PlatformEmergencyPrice, EmergencyDecline, ClinicReview
+    PlatformEmergencyPrice, EmergencyDecline, ClinicReview, AppointmentSlot
 )
 from schemas.appointment import EmergencyRequestResponse
 from pydantic import BaseModel
 from typing import Optional, List
 from datetime import datetime, timedelta
+from services.mercadopago_service import refund_payment as mp_refund
 import math
 import uuid
+import logging
 
 router = APIRouter(prefix="/appointments", tags=["appointments"])
 
@@ -53,6 +55,7 @@ class AppointmentCreate(BaseModel):
     notes: Optional[str] = None
     patient_latitude: float
     patient_longitude: float
+    slot_id: Optional[str] = None   # ID do slot reservado (obrigatório para agendamentos com agenda)
     # Campos de lentes de contato (opcionais — só presentes quando category == "lentes_contato")
     lens_upper_count: Optional[int] = None
     lens_lower_count: Optional[int] = None
@@ -116,43 +119,52 @@ def calculate_financial_split(
 ) -> dict:
     """
     Calcula divisão financeira:
-    - 1ª consulta: App paga 100% para clínica (investimento do app)
-    - Procedimentos: App fica com 15%, clínica recebe 85%
-    - Emergência: Regra especial (definir com cliente)
+    - 1ª consulta do paciente na clínica: 100% vai para o APP (investimento/aquisição)
+    - Demais consultas e procedimentos: 85% clínica, 15% app
+    - Emergência (1ª vez): tratada como primeira consulta → 100% app
+    - Emergência (retorno): 85% clínica, 15% app
+
+    "Primeira consulta" é definida como a primeira visita CONCLUÍDA do paciente
+    a esta clínica. Consultas pendentes, canceladas ou não pagas não contam.
     """
-    
-    # Verifica se é primeira vez nesta clínica
-    previous_appointments = db.query(Appointment).filter(
+
+    # Verifica se o paciente já concluiu algum atendimento nesta clínica
+    previous_completed = db.query(Appointment).filter(
         Appointment.patient_id == patient_id,
         Appointment.clinic_id == clinic_id,
         Appointment.status == "completed",
-        Appointment.service_type.in_(["first_consultation", "procedure"])
     ).count()
-    
-    is_first_time = previous_appointments == 0
-    
-    if service_type == "first_consultation" or (service_type == "emergency" and is_first_time):
+
+    is_first_time = previous_completed == 0
+
+    # Tipos que verificam o histórico para decidir o split
+    is_consultation = service_type in ("consultation", "first_consultation")
+    treat_as_first = (is_consultation or service_type == "emergency") and is_first_time
+
+    if treat_as_first:
+        # Primeira visita: o valor integral fica no APP (não repassa nada à clínica)
         return {
             "service_type": "first_consultation",
-            "total_amount": total_amount, 
-            "platform_fee": 0.0,
-            "clinic_amount": total_amount,
+            "total_amount": total_amount,
+            "platform_fee": round(total_amount, 2),   # 100% para o app
+            "clinic_amount": 0.0,                      # clínica não recebe
             "is_first_time": True,
-            "platform_profit": -total_amount,
-            "description": "Primeira consulta - App investe no paciente"
+            "platform_profit": round(total_amount, 2),
+            "description": "Primeira consulta — valor integral retido pelo app"
         }
     else:
-        platform_fee = total_amount * 0.15
-        clinic_amount = total_amount * 0.85
-        
+        # Retorno ou procedimento: 85% clínica, 15% app
+        platform_fee  = round(total_amount * 0.15, 2)
+        clinic_amount = round(total_amount * 0.85, 2)
+
         return {
-            "service_type": "procedure",
+            "service_type": service_type if service_type not in ("consultation", "first_consultation") else "procedure",
             "total_amount": total_amount,
             "platform_fee": platform_fee,
             "clinic_amount": clinic_amount,
-            "is_first_time": False,
+            "is_first_time": is_first_time,
             "platform_profit": platform_fee,
-            "description": f"Procedimento - Comissão 15% (R${platform_fee:.2f})"
+            "description": f"Comissão 15% (R${platform_fee:.2f})"
         }
 
 @router.post("/emergency/request")
@@ -426,6 +438,40 @@ def create_scheduled_appointment(
     if not clinic_proc:
         raise HTTPException(status_code=404, detail="Esta clínica não oferece este procedimento")
 
+    # ========== VALIDAÇÃO DO SLOT (se informado) ==========
+    slot = None
+    if data.slot_id:
+        slot = db.query(AppointmentSlot).filter(
+            AppointmentSlot.id == data.slot_id,
+            AppointmentSlot.clinic_id == data.clinic_id,
+        ).first()
+
+        if not slot:
+            raise HTTPException(status_code=404, detail="Slot não encontrado para esta clínica")
+
+        if slot.status != "reserved":
+            raise HTTPException(
+                status_code=409,
+                detail="Este horário não está mais reservado para você. Selecione novamente."
+            )
+
+        if str(slot.reserved_by) != str(user.id):
+            raise HTTPException(status_code=403, detail="Este slot não está reservado para você")
+
+        if slot.reservation_expires_at and slot.reservation_expires_at < datetime.utcnow():
+            slot.status = "available"
+            slot.reserved_by = None
+            slot.reserved_at = None
+            slot.reservation_expires_at = None
+            db.commit()
+            raise HTTPException(
+                status_code=409,
+                detail="A reserva de 10 minutos expirou. Selecione o horário novamente."
+            )
+
+        # Usar o horário exato do slot
+        data.scheduled_at = slot.start_time
+
     # Calcular valor total:
     # - Lentes de contato: preço por dente * (superiores + inferiores)
     # - Demais: preço do procedimento global
@@ -444,8 +490,10 @@ def create_scheduled_appointment(
     else:
         effective_price = global_proc.price
 
+    # "consultation" — calculate_financial_split decide se é first_consultation
+    # com base no histórico real do paciente nesta clínica.
     is_consulta = "consulta" in global_proc.name.lower() or global_proc.category == "consulta"
-    service_type = "first_consultation" if is_consulta else "procedure"
+    service_type = "consultation" if is_consulta else "procedure"
 
     financial_split = calculate_financial_split(
         db,
@@ -479,7 +527,13 @@ def create_scheduled_appointment(
     
     db.add(appointment)
     db.commit()
-    
+
+    # Vincular o slot ao appointment (estado: ainda "reserved" até pagamento)
+    if slot:
+        slot.appointment_id = appointment.id
+        slot.updated_at = datetime.utcnow()
+        db.commit()
+
     lens_info = None
     if is_lentes and data.lens_upper_count is not None:
         lens_info = {
@@ -541,8 +595,10 @@ def create_appointment(
     if effective_price is None:
         raise HTTPException(status_code=400, detail="Preço do procedimento não definido")
 
+    # "consultation" — calculate_financial_split decide se é first_consultation
+    # com base no histórico real do paciente nesta clínica.
     is_consulta = "consulta" in global_proc.name.lower() or global_proc.category == "consulta"
-    service_type = "first_consultation" if is_consulta else "procedure"
+    service_type = "consultation" if is_consulta else "procedure"
 
     financial_split = calculate_financial_split(
         db,
@@ -585,35 +641,108 @@ def create_appointment(
         "message": "Agendamento criado. Proceda com o pagamento para confirmar."
     }
 
+@router.patch("/{appointment_id}/checkin")
+def checkin_appointment(
+    appointment_id: str,
+    db: Session = Depends(get_db),
+    current_user = Depends(get_current_user)
+):
+    """Paciente chegou na clínica — muda de confirmed para waiting (sala de espera)."""
+    user = current_user["user"]
+    if current_user["payload"]["type"] != "clinica":
+        raise HTTPException(status_code=403, detail="Apenas clínicas")
+
+    clinic = db.query(Clinic).filter(Clinic.id == user.id).first()
+    if not clinic or not clinic.is_online:
+        raise HTTPException(
+            status_code=403,
+            detail="Você está offline. Mude para online para realizar o check-in."
+        )
+
+    appointment = db.query(Appointment).filter(Appointment.id == appointment_id).first()
+    if not appointment or appointment.clinic_id != user.id:
+        raise HTTPException(status_code=404, detail="Agendamento não encontrado")
+
+    if appointment.status != "confirmed":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Check-in só é possível para consultas confirmadas (status atual: {appointment.status})"
+        )
+
+    appointment.status = "waiting"
+    db.commit()
+
+    return {"message": "Check-in realizado. Paciente na sala de espera.", "status": "waiting"}
+
+
 @router.patch("/{appointment_id}/start")
 def start_appointment(
     appointment_id: str,
     db: Session = Depends(get_db),
     current_user = Depends(get_current_user)
 ):
-    """Clínica inicia o atendimento (muda de confirmed para in_progress) - BLOQUEADO se offline"""
+    """Clínica inicia o atendimento — aceita confirmed ou waiting (presencial/urgência)."""
     user = current_user["user"]
     if current_user["payload"]["type"] != "clinica":
         raise HTTPException(status_code=403, detail="Apenas clínicas")
-    
+
     clinic = db.query(Clinic).filter(Clinic.id == user.id).first()
     if not clinic or not clinic.is_online:
         raise HTTPException(
-            status_code=403, 
+            status_code=403,
             detail="Você está offline. Mude para online para iniciar atendimentos."
         )
-    
+
     appointment = db.query(Appointment).filter(Appointment.id == appointment_id).first()
     if not appointment or appointment.clinic_id != user.id:
         raise HTTPException(status_code=404, detail="Agendamento não encontrado")
-    
-    if appointment.status != "confirmed":
-        raise HTTPException(status_code=400, detail="Consulta precisa estar confirmada")
-    
+
+    # Aceita confirmed (agendado) ou waiting (paciente chegou / encaixe presencial / urgência)
+    if appointment.status not in ("confirmed", "waiting"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Consulta precisa estar confirmada ou em sala de espera (status atual: {appointment.status})"
+        )
+
     appointment.status = "in_progress"
     db.commit()
-    
+
     return {"message": "Atendimento iniciado", "status": "in_progress"}
+
+
+@router.patch("/{appointment_id}/complete")
+def complete_appointment(
+    appointment_id: str,
+    db: Session = Depends(get_db),
+    current_user = Depends(get_current_user)
+):
+    """Finaliza atendimento — aceita in_progress, waiting ou confirmed (urgência sem check-in)."""
+    user = current_user["user"]
+    if current_user["payload"]["type"] != "clinica":
+        raise HTTPException(status_code=403, detail="Apenas clínicas podem finalizar")
+
+    clinic = db.query(Clinic).filter(Clinic.id == user.id).first()
+    if not clinic or not clinic.is_online:
+        raise HTTPException(
+            status_code=403,
+            detail="Você está offline. Mude para online para finalizar atendimentos."
+        )
+
+    appointment = db.query(Appointment).filter(Appointment.id == appointment_id).first()
+    if not appointment or appointment.clinic_id != user.id:
+        raise HTTPException(status_code=404, detail="Agendamento não encontrado")
+
+    if appointment.status not in ("in_progress", "waiting", "confirmed"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Não é possível finalizar uma consulta com status '{appointment.status}'"
+        )
+
+    appointment.status = "completed"
+    appointment.completed_at = datetime.utcnow()
+    db.commit()
+
+    return {"message": "Atendimento finalizado com sucesso"}
 
 @router.get("/my")
 def get_my_appointments(
@@ -674,31 +803,86 @@ def cancel_appointment(
 ):
     user = current_user["user"]
     user_type = current_user["payload"]["type"]
-    
+
     appointment = db.query(Appointment).filter(Appointment.id == appointment_id).first()
     if not appointment:
         raise HTTPException(status_code=404, detail="Agendamento não encontrado")
-    
+
     if user_type == "paciente" and appointment.patient_id != user.id:
         raise HTTPException(status_code=403, detail="Sem permissão")
     if user_type == "clinica" and appointment.clinic_id != user.id:
         raise HTTPException(status_code=403, detail="Sem permissão")
-    
+
+    # Cancelamentos após a clínica já ter aceitado (confirmed / in_progress)
+    # não geram reembolso automático — precisam de análise caso a caso.
+    if appointment.status in ("confirmed", "in_progress"):
+        raise HTTPException(
+            status_code=400,
+            detail="Não é possível cancelar uma consulta que já foi aceita pela clínica. "
+                   "Entre em contato com o suporte.",
+        )
+
+    if appointment.status == "completed":
+        raise HTTPException(status_code=400, detail="Consulta já finalizada não pode ser cancelada.")
+
+    if appointment.status == "cancelled":
+        raise HTTPException(status_code=400, detail="Consulta já está cancelada.")
+
     appointment.status = "cancelled"
     appointment.cancellation_reason = reason
-    
+
+    # Reembolso real: apenas consultas no status "pending"
+    # (paciente pagou, mas a clínica ainda NÃO aceitou — pagamento completed no banco)
+    refund_attempted = False
+    refund_ok        = False
+
     payment = db.query(Payment).filter(
         Payment.appointment_id == appointment_id,
-        Payment.status == "completed"
+        Payment.status == "completed",
     ).first()
-    
-    if payment:
-        payment.status = "refunded"
-        payment.refunded_at = datetime.utcnow()
-    
+
+    if payment and payment.external_id:
+        refund_attempted = True
+        try:
+            mp_refund(payment.external_id)
+            payment.status      = "refunded"
+            payment.refunded_at = datetime.utcnow()
+            refund_ok           = True
+            logging.info(
+                "[cancel] Reembolso real realizado no MP | appointment=%s | payment=%s | external_id=%s",
+                appointment_id, payment.id, payment.external_id,
+            )
+        except Exception as exc:
+            # Reembolso falhou no MP — marcar como pending_refund para revisão manual
+            # MAS ainda cancela a consulta (o paciente não deve ficar preso)
+            payment.status = "pending_refund"
+            logging.error(
+                "[cancel] Falha ao reembolsar no MP | appointment=%s | payment=%s | erro=%s",
+                appointment_id, payment.id, exc,
+            )
+    elif payment and not payment.external_id:
+        # Pagamento sem external_id (raro — token salvo mas MP não gerou ID)
+        # Marcar como pending_refund para revisão manual
+        payment.status = "pending_refund"
+        logging.warning(
+            "[cancel] Payment sem external_id — marcado como pending_refund | payment=%s",
+            payment.id,
+        )
+
     db.commit()
-    
-    return {"message": "Agendamento cancelado com sucesso"}
+
+    # Montar mensagem de retorno com transparência sobre o reembolso
+    if not refund_attempted:
+        msg = "Agendamento cancelado com sucesso."
+    elif refund_ok:
+        msg = "Agendamento cancelado. O reembolso foi solicitado ao Mercado Pago e será processado em até 10 dias úteis."
+    else:
+        msg = (
+            "Agendamento cancelado. Houve um problema ao processar o reembolso automaticamente — "
+            "nossa equipe irá analisá-lo e entrará em contato em breve."
+        )
+
+    return {"message": msg, "refund_attempted": refund_attempted, "refund_ok": refund_ok}
 
 @router.patch("/{appointment_id}/confirm")
 def confirm_appointment(
@@ -726,34 +910,6 @@ def confirm_appointment(
     db.commit()
     
     return {"message": "Agendamento confirmado"}
-
-@router.patch("/{appointment_id}/complete")
-def complete_appointment(
-    appointment_id: str,
-    db: Session = Depends(get_db),
-    current_user = Depends(get_current_user)
-):
-    """Finaliza atendimento - BLOQUEADO se offline"""
-    user = current_user["user"]
-    if current_user["payload"]["type"] != "clinica":
-        raise HTTPException(status_code=403, detail="Apenas clínicas podem finalizar")
-    
-    clinic = db.query(Clinic).filter(Clinic.id == user.id).first()
-    if not clinic or not clinic.is_online:
-        raise HTTPException(
-            status_code=403, 
-            detail="Você está offline. Mude para online para finalizar atendimentos."
-        )
-    
-    appointment = db.query(Appointment).filter(Appointment.id == appointment_id).first()
-    if not appointment or appointment.clinic_id != user.id:
-        raise HTTPException(status_code=404, detail="Agendamento não encontrado")
-    
-    appointment.status = "completed"
-    appointment.completed_at = datetime.utcnow()
-    db.commit()
-    
-    return {"message": "Atendimento finalizado com sucesso"}
 
 @router.get("/{appointment_id}")
 def get_appointment_details(

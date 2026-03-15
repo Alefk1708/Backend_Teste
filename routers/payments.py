@@ -84,6 +84,15 @@ def _confirm_appointment_paid(db: Session, appointment: Appointment, payment: Pa
     db.commit()
 
 
+async def _confirm_slot_after_payment(appointment_id: str, db: Session):
+    """Confirma o slot vinculado ao agendamento após pagamento aprovado."""
+    try:
+        from routers.slots import confirm_slot_payment
+        await confirm_slot_payment(appointment_id, db)
+    except Exception as exc:
+        logging.warning("[payments] Falha ao confirmar slot: %s", exc)
+
+
 async def _notify_patient_ws(patient_id: str, appointment_id: str, payment_id: str, amount: float):
     """Notifica paciente via WebSocket."""
     await manager.send_to_user(str(patient_id), {
@@ -137,14 +146,14 @@ async def create_pix(
             detail="Valor do agendamento não definido. Entre em contato com o suporte."
         )
 
-    # ── SELECT FOR UPDATE: lock no agendamento ───────────────────────────────
-    # Bloqueia a linha do agendamento durante a transação inteira, impedindo
-    # que duas requisições simultâneas (duplo clique, retry) passem ao mesmo
-    # tempo pela verificação e criem dois payments para o mesmo agendamento.
-    db.execute(
-        text("SELECT id FROM appointments WHERE id = :aid FOR UPDATE"),
-        {"aid": data.appointment_id},
-    )
+    # ── Lock no agendamento para evitar pagamentos duplicados ────────────────
+    # with_for_update() usa SELECT ... FOR UPDATE no PostgreSQL (produção)
+    # e é ignorado silenciosamente no SQLite (desenvolvimento) — seguro porque
+    # o SQLite usa locking em nível de arquivo (WAL mode) e a UniqueConstraint
+    # do PaymentIdempotency serve como proteção extra em dev.
+    db.query(Appointment).filter(
+        Appointment.id == data.appointment_id
+    ).with_for_update().first()
 
     # Re-buscar o agendamento dentro do lock para garantir estado atualizado
     appointment = db.query(Appointment).filter(
@@ -229,6 +238,7 @@ async def create_card(
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
 ):
+    print(data)
     """
     Processa pagamento com cartão via Mercado Pago.
     O frontend gera o token com o SDK JS do MP antes de chamar este endpoint.
@@ -315,13 +325,12 @@ async def create_card(
     else:
         idem_record = None
 
-    # ── SELECT FOR UPDATE: lock no agendamento ────────────────────────────────
-    # Bloqueia a linha durante a transação inteira — nenhuma outra requisição
-    # simultânea consegue passar por aqui até esta terminar o commit/rollback.
-    db.execute(
-        text("SELECT id FROM appointments WHERE id = :aid FOR UPDATE"),
-        {"aid": data.appointment_id},
-    )
+    # ── Lock no agendamento para evitar pagamentos duplicados ────────────────
+    # with_for_update() usa SELECT ... FOR UPDATE no PostgreSQL (produção)
+    # e é ignorado silenciosamente no SQLite (desenvolvimento).
+    db.query(Appointment).filter(
+        Appointment.id == data.appointment_id
+    ).with_for_update().first()
 
     # Re-buscar dentro do lock para garantir estado atualizado
     appointment = db.query(Appointment).filter(
@@ -572,6 +581,11 @@ async def create_card(
             str(payment.id),
             float(payment.amount),
         )
+        background_tasks.add_task(
+            _confirm_slot_after_payment,
+            str(appointment.id),
+            db,
+        )
         return response_body
 
     # ── Em análise / pendente ─────────────────────────────────────────────────
@@ -741,6 +755,11 @@ async def mercadopago_webhook(
                 "data": {"appointment_id": str(appointment.id)},
                 "timestamp": datetime.utcnow().isoformat(),
             },
+        )
+        background_tasks.add_task(
+            _confirm_slot_after_payment,
+            str(appointment.id),
+            db,
         )
         logging.info("[webhook] Pagamento aprovado e consulta confirmada | payment_id=%s", payment.id)
 
