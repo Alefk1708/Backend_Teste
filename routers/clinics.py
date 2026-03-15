@@ -15,7 +15,7 @@ from core.security import get_current_user
 from models.models import (
     Clinic, ClinicProcedure, Procedure, Appointment,
     EmergencyRequest, ClinicReview, ClinicEmergencyPrice,
-    AppointmentSlot,
+    AppointmentSlot, WorkSchedule,
     PlatformEmergencyPrice,
 )
 from typing import Optional
@@ -354,6 +354,15 @@ def get_clinic_dashboard_stats(
         Appointment.status.in_(["confirmed", "awaiting_payment"]),
     ).count()
 
+    # ── Agenda configurada? ────────────────────────────────────────────────
+    # Verifica se a clínica tem ao menos 1 regra de trabalho ativa em
+    # WorkSchedule. Mais confiável que contar slots (que podem ser 0 num
+    # fim de semana ou antes da primeira geração de slots).
+    has_schedule_setup = db.query(WorkSchedule).filter(
+        WorkSchedule.clinic_id == user.id,
+        WorkSchedule.is_active == True,
+    ).first() is not None
+
     return {
         # Indicadores principais (usados pelos StatCards)
         "today_appointments": today_appointments,
@@ -374,6 +383,9 @@ def get_clinic_dashboard_stats(
         "is_active": clinic.is_active,
         "emergency_enabled": clinic.emergency_enabled,
         "can_receive_emergencies": clinic.is_online and clinic.is_active and clinic.emergency_enabled,
+
+        # Configuração de agenda — true se há ao menos 1 WorkSchedule ativo
+        "has_schedule_setup": has_schedule_setup,
     }
 
 
