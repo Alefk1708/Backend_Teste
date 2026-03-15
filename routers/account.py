@@ -10,10 +10,10 @@ from cloudinary.uploader import destroy
 
 from models.models import (
     User, Clinic, TwoFactorAuth, UniqueEmail, ActionAttempts,
-    ResetPasswordWithCode, Appointment, Payment, Notification, 
+    ResetPasswordWithCode, Appointment, Payment, Notification,
     ClinicReview, EmergencyRequest, EmergencyDecline, ClinicProcedure,
     ClinicFinancialAccount, ClinicEmergencyPrice, WithdrawalRequest,
-    PlatformTransaction
+    PlatformTransaction, TreatmentSuggestion, AppointmentSlot, WorkSchedule
 )
 
 router = APIRouter(prefix="/account", tags=["account"])
@@ -242,18 +242,18 @@ def request_delete_code(
 
 def _delete_patient_account(db: Session, user_id: str, two_factor_code=None):
     """Deleta conta de paciente e todos os dados vinculados"""
-    
+
     patient = db.query(User).filter(User.id == user_id).first()
     if not patient:
         raise HTTPException(status_code=404, detail="Paciente não encontrado")
-    
+
     # 1. Cancelar e reembolsar agendamentos futuros pagos
     future_apps = db.query(Appointment).filter(
         Appointment.patient_id == user_id,
         Appointment.scheduled_at > datetime.utcnow(),
         Appointment.status.in_(["pending", "confirmed", "awaiting_payment", "scheduled"])
     ).all()
-    
+
     for app in future_apps:
         payment = db.query(Payment).filter(
             Payment.appointment_id == app.id,
@@ -262,68 +262,95 @@ def _delete_patient_account(db: Session, user_id: str, two_factor_code=None):
         if payment:
             payment.status = "refunded"
             payment.refunded_at = datetime.utcnow()
-        
+
         app.status = "cancelled"
         app.cancellation_reason = "Conta excluída pelo usuário"
-    
-    # 2. Deletar notificações
+
+    # 2. Liberar slots reservados por este paciente (evita FK violation)
+    db.query(AppointmentSlot).filter(
+        AppointmentSlot.reserved_by == user_id
+    ).update(
+        {
+            "reserved_by": None,
+            "reserved_at": None,
+            "reservation_expires_at": None,
+            "status": "available",
+        },
+        synchronize_session=False,
+    )
+
+    # 3. Desvincular slots confirmados/em andamento deste paciente
+    #    (o appointment em si será deletado via cascade; o slot fica cancelado)
+    db.query(AppointmentSlot).filter(
+        AppointmentSlot.reserved_by == user_id
+    ).update({"reserved_by": None}, synchronize_session=False)
+
+    # 4. Deletar sugestões de tratamento do paciente (não cobertas por cascade de User)
+    db.query(TreatmentSuggestion).filter(
+        TreatmentSuggestion.patient_id == user_id
+    ).delete(synchronize_session=False)
+
+    # 5. Deletar TODAS as solicitações de emergência do paciente
+    #    (primeiro os declines para não violar FK em emergency_requests)
+    emergency_ids = [
+        e.id for e in db.query(EmergencyRequest).filter(
+            EmergencyRequest.patient_id == user_id
+        ).all()
+    ]
+    if emergency_ids:
+        db.query(EmergencyDecline).filter(
+            EmergencyDecline.emergency_request_id.in_(emergency_ids)
+        ).delete(synchronize_session=False)
+    db.query(EmergencyRequest).filter(
+        EmergencyRequest.patient_id == user_id
+    ).delete(synchronize_session=False)
+
+    # 6. Deletar notificações
     db.query(Notification).filter(
         Notification.user_id == user_id,
         Notification.user_type == "paciente"
     ).delete(synchronize_session=False)
-    
-    # 3. Deletar registros de autenticação (MENOS o código que já vamos deletar)
+
+    # 7. Deletar todos os registros de autenticação (2FA, reset, tentativas)
     if two_factor_code:
-        db.delete(two_factor_code)  # ✅ Deleta o código específico primeiro
-    
-    # Deleta outros códigos 2FA (se houver) - exceto o que já deletamos
+        db.delete(two_factor_code)
+
     db.query(TwoFactorAuth).filter(
-        TwoFactorAuth.entity_id == user_id,
-        TwoFactorAuth.entity_type != f"paciente_delete"  # Evita conflito se o código já foi deletado
+        TwoFactorAuth.entity_id == user_id
     ).delete(synchronize_session=False)
-    
+
     db.query(ResetPasswordWithCode).filter(
         ResetPasswordWithCode.entity_id == user_id
     ).delete(synchronize_session=False)
-    
+
     db.query(ActionAttempts).filter(
         ActionAttempts.entity_id == user_id
     ).delete(synchronize_session=False)
-    
-    # 4. Deletar solicitações de emergência pendentes
-    db.query(EmergencyRequest).filter(
-        EmergencyRequest.patient_id == user_id,
-        EmergencyRequest.status == "pending"
-    ).delete(synchronize_session=False)
-    
-    # 5. Deletar recusas de emergência (paciente não tem, mas por segurança)
-    db.query(EmergencyDecline).filter(
-        EmergencyDecline.clinic_id == user_id
-    ).delete(synchronize_session=False)
-    
-    # 6. Remover email de registros únicos
+
+    # 8. Remover email da tabela de emails únicos
     db.query(UniqueEmail).filter(
         UniqueEmail.entity_id == user_id
     ).delete(synchronize_session=False)
-    
-    # 7. Deletar paciente (cascade cuida de appointments, reviews, etc)
+
+    # 9. Deletar paciente — cascade cuida de: appointments (+ payments, reviews,
+    #    treatment_suggestions via origin_appointment), clinic_reviews
     db.delete(patient)
 
 
 def _delete_clinic_account(db: Session, clinic_id: str, two_factor_code=None):
     """Deleta conta de clínica e todos os dados vinculados"""
-    
+
     clinic = db.query(Clinic).filter(Clinic.id == clinic_id).first()
     if not clinic:
         raise HTTPException(status_code=404, detail="Clínica não encontrada")
-    
+
     # 1. Cancelar agendamentos futuros e reembolsar
     future_apps = db.query(Appointment).filter(
         Appointment.clinic_id == clinic_id,
         Appointment.scheduled_at > datetime.utcnow(),
         Appointment.status.in_(["pending", "confirmed", "awaiting_payment"])
     ).all()
-    
+
     for app in future_apps:
         payment = db.query(Payment).filter(
             Payment.appointment_id == app.id,
@@ -332,76 +359,85 @@ def _delete_clinic_account(db: Session, clinic_id: str, two_factor_code=None):
         if payment:
             payment.status = "refunded"
             payment.refunded_at = datetime.utcnow()
-        
+
         app.status = "cancelled"
         app.cancellation_reason = "Clínica encerrou atividades"
-    
+
     # 2. Verificar saques pendentes
     pending_withdrawals = db.query(WithdrawalRequest).filter(
         WithdrawalRequest.clinic_id == clinic_id,
         WithdrawalRequest.status == "pending"
     ).count()
-    
+
     if pending_withdrawals > 0:
         raise HTTPException(
-            status_code=400, 
+            status_code=400,
             detail=f"Existem {pending_withdrawals} saques pendentes. Aguarde processamento ou cancele antes de excluir."
         )
-    
+
     # 3. Verificar saldo disponível
     from routers.financial import calculate_clinic_balance
     balances = calculate_clinic_balance(db, clinic_id)
-    
+
     if balances["available_balance"] > 0:
         raise HTTPException(
             status_code=400,
             detail=f"Saldo disponível de R${balances['available_balance']:.2f}. Realize o saque antes de excluir."
         )
-    
-    # 4. Deletar notificações
+
+    # 4. Deletar slots de agenda (appointment_slots e work_schedules não têm cascade)
+    db.query(AppointmentSlot).filter(
+        AppointmentSlot.clinic_id == clinic_id
+    ).delete(synchronize_session=False)
+
+    db.query(WorkSchedule).filter(
+        WorkSchedule.clinic_id == clinic_id
+    ).delete(synchronize_session=False)
+
+    # 5. Deletar declines e emergency_requests vinculados à clínica
+    db.query(EmergencyDecline).filter(
+        EmergencyDecline.clinic_id == clinic_id
+    ).delete(synchronize_session=False)
+
+    db.query(EmergencyRequest).filter(
+        EmergencyRequest.clinic_id == clinic_id
+    ).delete(synchronize_session=False)
+
+    # 6. Deletar avaliações da clínica (não cobertas por cascade de Clinic)
+    db.query(ClinicReview).filter(
+        ClinicReview.clinic_id == clinic_id
+    ).delete(synchronize_session=False)
+
+    # 7. Deletar notificações
     db.query(Notification).filter(
         Notification.user_id == clinic_id,
         Notification.user_type == "clinica"
     ).delete(synchronize_session=False)
-    
-    # 5. Deletar registros de autenticação
+
+    # 8. Deletar todos os registros de autenticação (2FA, reset, tentativas)
     if two_factor_code:
-        db.delete(two_factor_code)  # ✅ Deleta o código específico primeiro
-    
+        db.delete(two_factor_code)
+
     db.query(TwoFactorAuth).filter(
-        TwoFactorAuth.entity_id == clinic_id,
-        TwoFactorAuth.entity_type != f"clinica_delete"
+        TwoFactorAuth.entity_id == clinic_id
     ).delete(synchronize_session=False)
-    
+
     db.query(ResetPasswordWithCode).filter(
         ResetPasswordWithCode.entity_id == clinic_id
     ).delete(synchronize_session=False)
-    
+
     db.query(ActionAttempts).filter(
         ActionAttempts.entity_id == clinic_id
     ).delete(synchronize_session=False)
-    
-    # 6. Deletar recusas de emergência
-    db.query(EmergencyDecline).filter(
-        EmergencyDecline.clinic_id == clinic_id
-    ).delete(synchronize_session=False)
-    
-    # 7. Deletar registros de emergência atendidas
-    db.query(EmergencyRequest).filter(
-        EmergencyRequest.clinic_id == clinic_id
-    ).delete(synchronize_session=False)
-    
-    # 8. Deletar avaliações
-    db.query(ClinicReview).filter(
-        ClinicReview.clinic_id == clinic_id
-    ).delete(synchronize_session=False)
-    
-    # 9. Remover email único
+
+    # 9. Remover email da tabela de emails únicos
     db.query(UniqueEmail).filter(
         UniqueEmail.entity_id == clinic_id
     ).delete(synchronize_session=False)
-    
-    # 10. Deletar clínica (cascade cuida do resto)
+
+    # 10. Deletar clínica — cascade cuida de: appointments (+ payments, reviews,
+    #     treatment_suggestions), clinic_procedures, emergency_price,
+    #     financial_account, withdrawal_requests
     db.delete(clinic)
 
 @router.post("/ConfirmDelete")

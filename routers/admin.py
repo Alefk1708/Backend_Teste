@@ -12,11 +12,12 @@ import uuid
 from database import get_db
 from core.security import get_current_user, require_admin
 from models.models import (
-    User, Clinic, Appointment, Payment, ClinicReview, 
+    User, Clinic, Appointment, Payment, ClinicReview,
     EmergencyRequest, Notification, WithdrawalRequest,
     ClinicFinancialAccount, PlatformTransaction, Procedure,
     ClinicProcedure, ClinicEmergencyPrice, PlatformEmergencyPrice,
-    TwoFactorAuth, ResetPasswordWithCode, ActionAttempts, UniqueEmail, EmergencyDecline
+    TwoFactorAuth, ResetPasswordWithCode, ActionAttempts, UniqueEmail, EmergencyDecline,
+    TreatmentSuggestion, AppointmentSlot, WorkSchedule
 )
 
 router = APIRouter(prefix="/admin", tags=["admin"])
@@ -400,41 +401,60 @@ def delete_clinic(
     # - financial_account
     # - withdrawal_requests
     
+    # Deletar slots de agenda (sem cascade no modelo)
+    db.query(AppointmentSlot).filter(
+        AppointmentSlot.clinic_id == clinic_id
+    ).delete(synchronize_session=False)
+
+    db.query(WorkSchedule).filter(
+        WorkSchedule.clinic_id == clinic_id
+    ).delete(synchronize_session=False)
+
+    # Deletar declines e emergency_requests vinculados à clínica
+    db.query(EmergencyDecline).filter(
+        EmergencyDecline.clinic_id == clinic_id
+    ).delete(synchronize_session=False)
+
+    db.query(EmergencyRequest).filter(
+        EmergencyRequest.clinic_id == clinic_id
+    ).delete(synchronize_session=False)
+
+    # Deletar avaliações da clínica (não cobertas por cascade de Clinic)
+    db.query(ClinicReview).filter(
+        ClinicReview.clinic_id == clinic_id
+    ).delete(synchronize_session=False)
+
     # Deletar notificações
     db.query(Notification).filter(
         Notification.user_id == clinic_id,
         Notification.user_type == "clinica"
     ).delete(synchronize_session=False)
-    
-    # Deletar registros de autenticação
+
+    # Deletar todos os registros de autenticação (sem filtro de entity_type
+    # para garantir que códigos de tipo "clinica_delete" também sejam removidos)
     db.query(TwoFactorAuth).filter(
-        TwoFactorAuth.entity_id == clinic_id,
-        TwoFactorAuth.entity_type == "clinica"
+        TwoFactorAuth.entity_id == clinic_id
     ).delete(synchronize_session=False)
-    
+
     db.query(ResetPasswordWithCode).filter(
-        ResetPasswordWithCode.entity_id == clinic_id,
-        ResetPasswordWithCode.entity_type == "clinica"
+        ResetPasswordWithCode.entity_id == clinic_id
     ).delete(synchronize_session=False)
-    
+
     db.query(ActionAttempts).filter(
         ActionAttempts.entity_id == clinic_id
     ).delete(synchronize_session=False)
-    
-    # Deletar registros de emergência
-    db.query(EmergencyDecline).filter(
-        EmergencyDecline.clinic_id == clinic_id
-    ).delete(synchronize_session=False)
-    
-    # Deletar email único
+
+    # Remover email da tabela de emails únicos
     db.query(UniqueEmail).filter(
         UniqueEmail.entity_id == clinic_id
     ).delete(synchronize_session=False)
-    
-    # Deletar a clínica (cascade faz o resto)
+
+    # Deletar a clínica — cascade cuida de: appointments (+ payments, reviews,
+    # treatment_suggestions), clinic_procedures, emergency_price,
+    # financial_account, withdrawal_requests
     db.delete(clinic)
     db.commit()
-    
+
     return {
         "message": "Clínica e todos os dados vinculados removidos com sucesso",
         "deleted_clinic_id": clinic_id
@@ -641,36 +661,68 @@ def delete_patient(
     # - Deletar todos os reviews do paciente
     # - Deletar todos os emergency_requests do paciente
     
+    # Liberar slots reservados por este paciente (evita FK violation em reserved_by)
+    db.query(AppointmentSlot).filter(
+        AppointmentSlot.reserved_by == patient_id
+    ).update(
+        {
+            "reserved_by": None,
+            "reserved_at": None,
+            "reservation_expires_at": None,
+            "status": "available",
+        },
+        synchronize_session=False,
+    )
+
+    # Deletar sugestões de tratamento do paciente (não cobertas por cascade de User)
+    db.query(TreatmentSuggestion).filter(
+        TreatmentSuggestion.patient_id == patient_id
+    ).delete(synchronize_session=False)
+
+    # Deletar solicitações de emergência e seus declines
+    emergency_ids = [
+        e.id for e in db.query(EmergencyRequest).filter(
+            EmergencyRequest.patient_id == patient_id
+        ).all()
+    ]
+    if emergency_ids:
+        db.query(EmergencyDecline).filter(
+            EmergencyDecline.emergency_request_id.in_(emergency_ids)
+        ).delete(synchronize_session=False)
+    db.query(EmergencyRequest).filter(
+        EmergencyRequest.patient_id == patient_id
+    ).delete(synchronize_session=False)
+
     # Deletar notificações do paciente
     db.query(Notification).filter(
         Notification.user_id == patient_id,
         Notification.user_type == "paciente"
     ).delete(synchronize_session=False)
-    
-    # Deletar registros de autenticação
+
+    # Deletar todos os registros de autenticação (sem filtro de entity_type
+    # para garantir que códigos de tipo "paciente_delete" também sejam removidos)
     db.query(TwoFactorAuth).filter(
-        TwoFactorAuth.entity_id == patient_id,
-        TwoFactorAuth.entity_type == "paciente"
+        TwoFactorAuth.entity_id == patient_id
     ).delete(synchronize_session=False)
-    
+
     db.query(ResetPasswordWithCode).filter(
-        ResetPasswordWithCode.entity_id == patient_id,
-        ResetPasswordWithCode.entity_type == "paciente"
+        ResetPasswordWithCode.entity_id == patient_id
     ).delete(synchronize_session=False)
-    
+
     db.query(ActionAttempts).filter(
         ActionAttempts.entity_id == patient_id
     ).delete(synchronize_session=False)
-    
-    # Deletar email do registro de emails únicos
+
+    # Remover email da tabela de emails únicos
     db.query(UniqueEmail).filter(
         UniqueEmail.entity_id == patient_id
     ).delete(synchronize_session=False)
-    
-    # Finalmente, deletar o paciente (cascade cuida do resto)
+
+    # Deletar o paciente — cascade cuida de: appointments (+ payments, reviews,
+    # treatment_suggestions via origin_appointment), clinic_reviews
     db.delete(patient)
     db.commit()
-    
+
     return {
         "message": "Paciente e todos os dados vinculados removidos com sucesso",
         "deleted_patient_id": patient_id
@@ -1608,17 +1660,25 @@ def delete_admin(
     if not admin:
         raise HTTPException(status_code=404, detail="Administrador não encontrado")
 
+    # Deletar notificações do admin
+    db.query(Notification).filter(
+        Notification.user_id == admin_id
+    ).delete(synchronize_session=False)
+
+    # Deletar todos os registros de autenticação (sem filtro de entity_type)
     db.query(TwoFactorAuth).filter(
-        TwoFactorAuth.entity_id == admin_id,
-        TwoFactorAuth.entity_type == "admin",
+        TwoFactorAuth.entity_id == admin_id
     ).delete(synchronize_session=False)
+
     db.query(ResetPasswordWithCode).filter(
-        ResetPasswordWithCode.entity_id == admin_id,
-        ResetPasswordWithCode.entity_type == "admin",
+        ResetPasswordWithCode.entity_id == admin_id
     ).delete(synchronize_session=False)
+
     db.query(ActionAttempts).filter(
         ActionAttempts.entity_id == admin_id
     ).delete(synchronize_session=False)
+
+    # Remover email da tabela de emails únicos
     db.query(UniqueEmail).filter(
         UniqueEmail.entity_id == admin_id
     ).delete(synchronize_session=False)
